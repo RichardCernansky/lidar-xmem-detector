@@ -9,7 +9,7 @@ EXTRA_TAG="phase1"
 WORKERS=4
 SEQ_LEN=8
 STRIDE=4
-MAX_GRAD_NORM=35.0
+MAX_GRAD_NORM=10.0
 
 
 python train_temporal.py \

@@ -213,7 +213,7 @@ def train_one_epoch(
             n_aux += 1
 
         if (seq_idx + 1) % 50 == 0:
-            lr = optimizer.param_groups[0]["lr"]
+            lr = optimizer.param_groups[1]["lr"]
 
             win_loss = _avg(w_loss)
             win_cls = _avg(w_cls)
@@ -352,7 +352,7 @@ def train_phase(
 
     for epoch in range(start_epoch, total_epochs):
         alpha = alpha_ramp_epoch(epoch)
-        lr = optimizer.param_groups[0]["lr"]
+        lr = optimizer.param_groups[1]["lr"]
         logger.info(f"Epoch {epoch + 1}/{total_epochs} alpha={alpha:.3f} lr={lr:.3e}")
 
         train_one_epoch(
@@ -489,8 +489,8 @@ def main():
             resume_blob=resume_blob,
             start_epoch=start_epoch,
             epochs=5,
-            lr_start=1e-5,
-            lr_max=1e-4,
+            lr_start=1e-4,
+            lr_max=1e-3,
             lr_end=5e-5,
             warmup_epochs=1,
             alpha_start=0.05,
@@ -500,6 +500,7 @@ def main():
         return
 
     if args.phase == 2:
+        print("Starting Phase 2 Training")
         PHASE2_PREFIXES = (
             "dense_head",
             "xmem",
@@ -511,7 +512,7 @@ def main():
         )
         train_phase(
             args=args,
-            prefixes=PHASE1_PREFIXES,
+            prefixes=PHASE2_PREFIXES,
             model=model,
             train_loader=train_loader,
             cfg=cfg,
@@ -519,14 +520,14 @@ def main():
             device=device,
             resume_blob=resume_blob,
             start_epoch=start_epoch,
-            epochs=5,
-            lr_start=1e-5,
+            epochs=18,
+            lr_start=5e-5,
             lr_max=1e-4,
-            lr_end=1e-6,
-            warmup_epochs=1,
-            alpha_start=0,
-            alpha_end=0.7,
-            alpha_ramp_epochs=20
+            lr_end=5e-7,
+            warmup_epochs=0,
+            alpha_start=0.0,
+            alpha_end=1.0,
+            alpha_ramp_epochs=12
         )
 
 

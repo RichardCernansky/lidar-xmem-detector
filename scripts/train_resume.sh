@@ -3,13 +3,13 @@ set -euo pipefail
 CFG_FILE="xmem_det/configs/temporal_pp_xmem_nuscenes.yaml"
 XMEM_CFG="xmem_det/configs/xmem.yaml"
 
-LATEST_CKPT="./log/phase1_ckpt_epoch_20.pth"
+LATEST_CKPT="./log/phase_ckpt_epoch_7.pth"
 
 EXTRA_TAG="resume_phase1"
 WORKERS=4
 SEQ_LEN=8
 STRIDE=4
-MAX_GRAD_NORM=35.0
+MAX_GRAD_NORM=10.0
 
 python train_temporal.py \
   --cfg_file "$CFG_FILE" \
@@ -20,4 +20,4 @@ python train_temporal.py \
   --seq_len "$SEQ_LEN" \
   --stride "$STRIDE" \
   --max_grad_norm "$MAX_GRAD_NORM" \
-  --phase1
+  --phase 2
