@@ -6,7 +6,7 @@ from pcdet.models.detectors.pointpillar import PointPillar
 from xmem_det.xmem_wrapper import XMemBackboneWrapper
 from xmem_det.util import boxes_to_bev_masks
 
-#motion compensate masks!
+
 class TemporalPointPillar(PointPillar):
     def __init__(self, model_cfg, num_class, dataset, xmem_train_cfg, pc_range):
         super().__init__(model_cfg=model_cfg, num_class=num_class, dataset=dataset)
@@ -37,7 +37,6 @@ class TemporalPointPillar(PointPillar):
         D = self.xmem.hidden_dim
         self.state_gate = nn.Conv2d(c_bev + 2 * D, D, kernel_size=1)
         self.state_cand = nn.Conv2d(c_bev + 2 * D, D, kernel_size=3, padding=1)
-
 
     def reset_sequence(self, seq_id: int):
         self.xmem.clear_memory()
@@ -161,6 +160,12 @@ class TemporalPointPillar(PointPillar):
         return F.grid_sample(mask_prev, grid, mode=mode, padding_mode="zeros", align_corners=False)
 
 
+    def detach_temporal_state(self):
+        if isinstance(self.hidden_prev, torch.Tensor):
+            self.hidden_prev = self.hidden_prev.detach()
+        if hasattr(self.xmem, "detach_memory"):
+            self.xmem.detach_memory()
+
     def forward(
         self,
         batch_dict,
@@ -170,6 +175,7 @@ class TemporalPointPillar(PointPillar):
         alpha_temporal: float = 1.0,
         compute_det_loss: bool = True,
         compute_aux_loss: bool = True,
+        keep_state_grad: bool = False,
     ):
         aux_loss = None
 
@@ -220,7 +226,7 @@ class TemporalPointPillar(PointPillar):
                     diff = torch.abs(motion_pred - motion_gt)
                     aux_loss = (diff * valid_area).sum() / (valid_area.sum() + 1e-6)
 
-                self.hidden_prev = hidden_out.detach()
+                self.hidden_prev = hidden_out if keep_state_grad else hidden_out.detach()
 
 
         if self.training:

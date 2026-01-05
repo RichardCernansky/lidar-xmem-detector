@@ -187,4 +187,4 @@ class XMemBackboneWrapper(nn.Module):
                 mode='bilinear', align_corners=False
             )
             
-            return occupancy_logits, hidden_features
+        return occupancy_logits, hidden_features

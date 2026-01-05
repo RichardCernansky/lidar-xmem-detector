@@ -88,6 +88,7 @@ def train_one_epoch(
     alpha_temporal: float,
     supervise_det: bool,
     supervise_aux: bool,
+    tbptt_k: int = 1,
 ):
     model.train()
 
@@ -118,16 +119,24 @@ def train_one_epoch(
         return (sum(dq) / len(dq)) if len(dq) > 0 else None
 
     for seq_idx, seq in enumerate(train_loader):
+        torch.cuda.reset_peak_memory_stats()
+
         frames = seq["frames"]
         T_world_lidar = seq["T_world_lidar"]
         T = len(frames)
+
+        if T == 0:
+            continue
 
         if hasattr(model, "reset_sequence"):
             model.reset_sequence(seq_idx)
 
         det_instance_masks_prev = None
 
-        for t in range(max(T - 1, 0)):
+        K = int(tbptt_k)
+        burn = max(T - K, 0)
+
+        for t in range(burn):
             frame = frames[t]
             batch_dict = to_torch_batch_dict(frame, device)
 
@@ -146,13 +155,38 @@ def train_one_epoch(
                     alpha_temporal=alpha_temporal,
                     compute_det_loss=False,
                     compute_aux_loss=False,
+                    keep_state_grad=False,
                 )
 
             if isinstance(det_instance_masks_prev, torch.Tensor):
                 det_instance_masks_prev = det_instance_masks_prev.detach()
 
-        if T == 0:
-            continue
+        if hasattr(model, "detach_temporal_state"):
+            model.detach_temporal_state()
+
+        for t in range(burn, T - 1):
+            frame = frames[t]
+            batch_dict = to_torch_batch_dict(frame, device)
+
+            if t == 0:
+                T_rel = None
+            else:
+                T_rel_np = rel_T_curr_prev(T_world_lidar, t)
+                T_rel = torch.from_numpy(T_rel_np).to(device, non_blocking=True)
+
+            _, _, _, det_instance_masks_prev = model(
+                batch_dict,
+                t_seq=t,
+                det_instance_masks_prev=det_instance_masks_prev,
+                T_rel=T_rel,
+                alpha_temporal=alpha_temporal,
+                compute_det_loss=False,
+                compute_aux_loss=False,
+                keep_state_grad=True,
+            )
+
+            if isinstance(det_instance_masks_prev, torch.Tensor):
+                det_instance_masks_prev = det_instance_masks_prev.detach()
 
         t_last = T - 1
         frame = frames[t_last]
@@ -172,12 +206,27 @@ def train_one_epoch(
             alpha_temporal=alpha_temporal,
             compute_det_loss=bool(supervise_det),
             compute_aux_loss=bool(supervise_aux),
+            keep_state_grad=True,
         )
 
         loss = ret_dict["loss"]
 
         optimizer.zero_grad()
         loss.backward()
+        print(torch.cuda.max_memory_allocated() / (1024**2))
+
+        def grad_norm(m):
+            s = 0.0
+            for p in m.parameters():
+                if p.grad is not None:
+                    s += float(p.grad.detach().norm().item())
+            return s
+
+        print("state_gate", grad_norm(model.state_gate))
+        print("state_cand", grad_norm(model.state_cand))
+        print("motion_tf", grad_norm(model.motion_transform_net))
+
+
         clip_grad_norm_(model.parameters(), max_grad_norm)
         optimizer.step()
         if scheduler is not None:
@@ -213,7 +262,7 @@ def train_one_epoch(
             n_aux += 1
 
         if (seq_idx + 1) % 50 == 0:
-            lr = optimizer.param_groups[1]["lr"]
+            lr = optimizer.param_groups[0]["lr"]
 
             win_loss = _avg(w_loss)
             win_cls = _avg(w_cls)
@@ -253,6 +302,7 @@ def train_one_epoch(
     if len(w_aux) > 0:
         msg += f", win200_aux {_avg(w_aux):.4f}"
     logger.info(msg)
+
 
 
 def train_phase(
@@ -352,7 +402,7 @@ def train_phase(
 
     for epoch in range(start_epoch, total_epochs):
         alpha = alpha_ramp_epoch(epoch)
-        lr = optimizer.param_groups[1]["lr"]
+        lr = optimizer.param_groups[0]["lr"]
         logger.info(f"Epoch {epoch + 1}/{total_epochs} alpha={alpha:.3f} lr={lr:.3e}")
 
         train_one_epoch(
