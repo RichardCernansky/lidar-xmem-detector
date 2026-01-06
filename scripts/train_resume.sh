@@ -3,9 +3,9 @@ set -euo pipefail
 CFG_FILE="xmem_det/configs/temporal_pp_xmem_nuscenes.yaml"
 XMEM_CFG="xmem_det/configs/xmem.yaml"
 
-LATEST_CKPT="./log/phase_ckpt_epoch_7.pth"
+LATEST_CKPT="./log/phase_ckpt_epoch_9.pth"
 
-EXTRA_TAG="resume_phase1"
+EXTRA_TAG="resume_phase2"
 WORKERS=4
 SEQ_LEN=8
 STRIDE=4

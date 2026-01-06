@@ -88,7 +88,7 @@ def train_one_epoch(
     alpha_temporal: float,
     supervise_det: bool,
     supervise_aux: bool,
-    tbptt_k: int = 1,
+    tbptt_k: int = 8,
 ):
     model.train()
 
@@ -213,18 +213,18 @@ def train_one_epoch(
 
         optimizer.zero_grad()
         loss.backward()
-        print(torch.cuda.max_memory_allocated() / (1024**2))
+        # print(torch.cuda.max_memory_allocated() / (1024**2))
 
-        def grad_norm(m):
-            s = 0.0
-            for p in m.parameters():
-                if p.grad is not None:
-                    s += float(p.grad.detach().norm().item())
-            return s
+        # def grad_norm(m):
+        #     s = 0.0
+        #     for p in m.parameters():
+        #         if p.grad is not None:
+        #             s += float(p.grad.detach().norm().item())
+        #     return s
 
-        print("state_gate", grad_norm(model.state_gate))
-        print("state_cand", grad_norm(model.state_cand))
-        print("motion_tf", grad_norm(model.motion_transform_net))
+        # print("state_gate", grad_norm(model.state_gate))
+        # print("state_cand", grad_norm(model.state_cand))
+        # print("motion_tf", grad_norm(model.motion_transform_net))
 
 
         clip_grad_norm_(model.parameters(), max_grad_norm)
@@ -356,9 +356,9 @@ def train_phase(
     TEMPORAL_LR_MULT = 1.0
     BACKBONE2D_LR_MULT = 0.05
     group_specs = [
+        (("xmem", "motion_transform_net", "aux_head", "temporal_fusion", "state_gate", "state_cand"), TEMPORAL_LR_MULT),
         (("dense_head",), HEAD_LR_MULT),
         (("backbone_2d",), BACKBONE2D_LR_MULT),
-        (("xmem", "motion_transform_net", "aux_head", "temporal_fusion", "state_gate", "state_cand"), TEMPORAL_LR_MULT),
     ]
     total_epochs = int(epochs)
     start_epoch = int(start_epoch)
@@ -543,9 +543,9 @@ def main():
             lr_max=1e-3,
             lr_end=5e-5,
             warmup_epochs=1,
-            alpha_start=0.05,
-            alpha_end=0.35,
-            alpha_ramp_epochs=5
+            alpha_start=1.0,
+            alpha_end=1.0,
+            alpha_ramp_epochs=1
         )
         return
 
@@ -574,7 +574,7 @@ def main():
             lr_start=5e-5,
             lr_max=1e-4,
             lr_end=5e-7,
-            warmup_epochs=0,
+            warmup_epochs=1,
             alpha_start=0.0,
             alpha_end=1.0,
             alpha_ramp_epochs=12

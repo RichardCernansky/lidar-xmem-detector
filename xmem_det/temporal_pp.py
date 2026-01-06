@@ -165,6 +165,22 @@ class TemporalPointPillar(PointPillar):
             self.hidden_prev = self.hidden_prev.detach()
         if hasattr(self.xmem, "detach_memory"):
             self.xmem.detach_memory()
+    
+    def tinfo(name, x):
+        if x is None:
+            print(name, "None")
+            return
+        if isinstance(x, list):
+            print(name, "list", "len", len(x))
+            if len(x) > 0 and torch.is_tensor(x[0]):
+                y = x[0]
+                print(name + "[0]", "req", y.requires_grad, "has_fn", y.grad_fn is not None, "shape", tuple(y.shape))
+            return
+        if torch.is_tensor(x):
+            print(name, "req", x.requires_grad, "has_fn", x.grad_fn is not None, "shape", tuple(x.shape))
+            return
+        print(name, "type", type(x))
+
 
     def forward(
         self,
@@ -217,7 +233,12 @@ class TemporalPointPillar(PointPillar):
                 hidden_used = hidden_out * a
 
                 bev_fused = self.temporal_fusion(torch.cat([bev * gate_used, hidden_used], dim=1))
+                
                 batch_dict["spatial_features_2d"] = bev_fused
+
+
+
+                
 
                 if self.training and compute_aux_loss and t_seq > 0 and self.hidden_prev is not None and T_rel is not None:
                     motion_gt = self._motion6_map(T_rel, H, W, bev.device, bev.dtype).detach()
