@@ -287,6 +287,25 @@ def train_one_epoch(
             loss_str += f"lr {lr:.6e}"
             logger.info(loss_str)
 
+        if (seq_idx + 1) % 2 == 0:
+            keys = [
+                "_dbg_alpha",
+                "_dbg_hidden_prev_has_fn",
+                "_dbg_hidden_to_bev",
+                "_dbg_temporal_delta",
+                "_dbg_bev_delta",
+                "_dbg_gate_used_mean",
+                "_dbg_gate_mean",
+                "_dbg_z_mean",
+            ]
+            vals = []
+            for k in keys:
+                if k in tb_dict:
+                    vals.append(f"{k}={float(tb_dict[k].detach().item()):.6f}")
+            if len(vals) > 0:
+                print("TEMPDBG", " ".join(vals))
+
+
     epoch_avg_loss = sum_loss / max(n_loss, 1)
     msg = f"epoch {epoch + 1}/{total_epochs} summary: avg_loss {epoch_avg_loss:.4f}"
     if n_cls > 0:
@@ -352,7 +371,7 @@ def train_phase(
     #     warmup_epochs=warmup_epochs,
     # )
 
-    HEAD_LR_MULT = 0.1 
+    HEAD_LR_MULT = 0.2 
     TEMPORAL_LR_MULT = 1.0
     BACKBONE2D_LR_MULT = 0.05
     group_specs = [
@@ -521,11 +540,8 @@ def main():
     if args.phase == 1:
         PHASE1_PREFIXES = (
             "xmem",
-            "motion_transform_net",
-            "aux_head",
-            "temporal_fusion",
-            "state_gate",
-            "state_cand",
+            "hidden_to_bev",
+            "dense_head",
         )
 
         train_phase(
@@ -538,14 +554,14 @@ def main():
             device=device,
             resume_blob=resume_blob,
             start_epoch=start_epoch,
-            epochs=5,
-            lr_start=1e-4,
-            lr_max=1e-3,
-            lr_end=5e-5,
+            epochs=6,
+            lr_start=5e-5,
+            lr_max=5e-4,
+            lr_end=5e-6,
             warmup_epochs=1,
-            alpha_start=1.0,
+            alpha_start=0.0,
             alpha_end=1.0,
-            alpha_ramp_epochs=1
+            alpha_ramp_epochs=6,
         )
         return
 

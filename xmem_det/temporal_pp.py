@@ -20,8 +20,6 @@ class TemporalPointPillar(PointPillar):
         )
 
         self.pc_range = pc_range
-        self.temporal_fusion = nn.Conv2d(c_bev + self.xmem.hidden_dim, c_bev, kernel_size=1)
-
         self.motion_transform_net = nn.Conv2d(self.xmem.hidden_dim + 6, self.xmem.hidden_dim, 3, padding=1)
 
         mid = max(self.xmem.hidden_dim // 2, 1)
@@ -35,8 +33,11 @@ class TemporalPointPillar(PointPillar):
         self.hidden_prev = None
 
         D = self.xmem.hidden_dim
-        self.state_gate = nn.Conv2d(c_bev + 2 * D, D, kernel_size=1)
-        self.state_cand = nn.Conv2d(c_bev + 2 * D, D, kernel_size=3, padding=1)
+        self.state_gate = nn.Conv2d(2 * D, D, kernel_size=1)
+        self.state_cand = nn.Conv2d(2 * D, D, kernel_size=3, padding=1)
+
+
+        self.hidden_to_bev = nn.Conv2d(self.xmem.hidden_dim, c_bev, kernel_size=1)
 
     def reset_sequence(self, seq_id: int):
         self.xmem.clear_memory()
@@ -214,40 +215,34 @@ class TemporalPointPillar(PointPillar):
                     t_seq,
                     bev,
                     scene_mask=scene_mask,
+                    keep_state_grad=keep_state_grad,
                 )
 
-                if t_seq > 0 and self.hidden_prev is not None and T_rel is not None:
-                    motion_gt = self._motion6_map(T_rel, H, W, bev.device, bev.dtype)
-                    prior_to_cur = self.motion_transform_net(torch.cat([self.hidden_prev, motion_gt], dim=1))
-                else:
-                    prior_to_cur = torch.zeros_like(hidden_cur)
-
-                u = torch.cat([bev, hidden_cur, prior_to_cur], dim=1)
-                z = torch.sigmoid(self.state_gate(u))
-                h_tilde = torch.tanh(self.state_cand(u))
-                hidden_out = (1.0 - z) * prior_to_cur + z * h_tilde
-
-                gate = torch.sigmoid(occ_logits)
                 a = float(alpha_temporal)
-                gate_used = gate * a + (1.0 - a)
-                hidden_used = hidden_out * a
+                temp = self.hidden_to_bev(hidden_cur)
+                batch_dict["spatial_features_2d"] = bev + a * temp
 
-                bev_fused = self.temporal_fusion(torch.cat([bev * gate_used, hidden_used], dim=1))
+
+                # if t_seq > 0 and self.hidden_prev is not None and T_rel is not None:
+                #     motion_gt = self._motion6_map(T_rel, H, W, bev.device, bev.dtype)
+                #     prior_to_cur = self.motion_transform_net(torch.cat([self.hidden_prev, motion_gt], dim=1))
+                # else:
+                #     prior_to_cur = torch.zeros_like(hidden_cur)
+
+                # u = torch.cat([hidden_cur, prior_to_cur], dim=1)
+                # z = torch.sigmoid(self.state_gate(u))
+                # h_tilde = torch.tanh(self.state_cand(u))
+                # hidden_out = (1.0 - z) * prior_to_cur + z * h_tilde
+                # batch_dict["spatial_features_2d"] = self.hidden_to_bev(hidden_out)
                 
-                batch_dict["spatial_features_2d"] = bev_fused
+                # if self.training and compute_aux_loss and t_seq > 0 and self.hidden_prev is not None and T_rel is not None:
+                #     motion_gt = self._motion6_map(T_rel, H, W, bev.device, bev.dtype).detach()
+                #     motion_pred = self.aux_head(prior_to_cur)
+                #     valid_area = self._build_scene_mask_from_bev(bev).detach()
+                #     diff = torch.abs(motion_pred - motion_gt)
+                #     aux_loss = (diff * valid_area).sum() / (valid_area.sum() + 1e-6)
 
-
-
-                
-
-                if self.training and compute_aux_loss and t_seq > 0 and self.hidden_prev is not None and T_rel is not None:
-                    motion_gt = self._motion6_map(T_rel, H, W, bev.device, bev.dtype).detach()
-                    motion_pred = self.aux_head(prior_to_cur)
-                    valid_area = self._build_scene_mask_from_bev(bev).detach()
-                    diff = torch.abs(motion_pred - motion_gt)
-                    aux_loss = (diff * valid_area).sum() / (valid_area.sum() + 1e-6)
-
-                self.hidden_prev = hidden_out if keep_state_grad else hidden_out.detach()
+                # self.hidden_prev = hidden_out if keep_state_grad else hidden_out.detach()
 
 
         if self.training:
@@ -287,6 +282,24 @@ class TemporalPointPillar(PointPillar):
 
             if aux_loss is not None:
                 tb_dict["aux_motion_tf"] = aux_loss.detach()
+
+            for k in [
+                "_dbg_gate_mean",
+                "_dbg_gate_used_mean",
+                "_dbg_hidden_used_l1",
+                "_dbg_bev_l1",
+                "_dbg_hidden_to_bev",
+                "_dbg_prior_l1",
+                "_dbg_hidden_cur_l1",
+                "_dbg_z_mean",
+                "_dbg_bev_delta",
+                "_dbg_temporal_delta",
+                "_dbg_hidden_prev_has_fn",
+                "_dbg_alpha",
+            ]:
+                if k in batch_dict:
+                    tb_dict[k] = batch_dict[k]
+
 
             return {"loss": loss}, tb_dict, disp_dict, det_masks_next
 
