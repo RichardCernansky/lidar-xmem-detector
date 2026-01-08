@@ -55,21 +55,25 @@ class XMemBackboneWrapper(nn.Module):
         
         self.bev_adapter = nn.Conv2d(bev_channels, 3, kernel_size=1)
         self.mms = []
-    
+
+    def _new_mm(self):
+        mm = MemoryManager(config=self.xmem_config.copy())
+        mm.ti = -1
+        mm.set_hidden(None)
+        return mm
+
     def clear_memory(self):
-        """Reset memory at start of each sequence"""
         self.mms = []
     
-    def forward_step(self, t: int, bev_features: torch.Tensor, scene_mask: torch.Tensor, keep_state_grad: bool = False):
+    def forward_step(self, t: int, bev_features: torch.Tensor, scene_mask: torch.Tensor, keep_state_grad: bool = False, history_mode:str = "full"):
         B = bev_features.size(0)
 
         if t == 0 or len(self.mms) != B:
-            self.mms = []
-            for _ in range(B):
-                mm = MemoryManager(config=self.xmem_config.copy())
-                mm.ti = -1
-                mm.set_hidden(None)
-                self.mms.append(mm)
+            self.mms = [self._new_mm() for _ in range(B)]
+
+        if history_mode == "reset_each":
+            print("Resetting XMem memory at each step!")
+            self.mms = [self._new_mm() for _ in range(B)]
 
         frames_img = self.bev_adapter(bev_features)
 
@@ -93,6 +97,7 @@ class XMemBackboneWrapper(nn.Module):
             k_l, sh_l, sel_l, f16, f8, f4 = self.xmem_core.encode_key(
                 frames_img[b:b+1], need_ek=True, need_sk=True
             )
+
             if sel_l.dim() == 2:
                 sel_l = sel_l.unsqueeze(0)
 

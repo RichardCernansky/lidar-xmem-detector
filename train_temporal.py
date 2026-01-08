@@ -284,26 +284,24 @@ def train_one_epoch(
             if "aux_motion_tf" in tb_dict:
                 loss_str += f"aux {_to_float(tb_dict['aux_motion_tf']):.4f}, win200_aux {win_aux:.4f}, "
 
+            dbg_s = batch_dict.get("_dbg_s", None)
+            if dbg_s is not None:
+                dbg_bev_l1 = batch_dict.get("_dbg_bev_l1", None)
+                dbg_temp_l1 = batch_dict.get("_dbg_temp_l1_scaled", None)
+                dbg_temp_ratio = batch_dict.get("_dbg_temp_ratio", None)
+                dbg_delta_ratio = batch_dict.get("_dbg_delta_ratio", None)
+
+                loss_str += (
+                    f"s {_to_float(dbg_s):.3f}, "
+                    f"bev_l1 {_to_float(dbg_bev_l1):.3e}, "
+                    f"temp_l1 {_to_float(dbg_temp_l1):.3e}, "
+                    f"temp_ratio {_to_float(dbg_temp_ratio):.3f}, "
+                    f"delta_ratio {_to_float(dbg_delta_ratio):.3f}, "
+                )
+
             loss_str += f"lr {lr:.6e}"
             logger.info(loss_str)
 
-        if (seq_idx + 1) % 2 == 0:
-            keys = [
-                "_dbg_alpha",
-                "_dbg_hidden_prev_has_fn",
-                "_dbg_hidden_to_bev",
-                "_dbg_temporal_delta",
-                "_dbg_bev_delta",
-                "_dbg_gate_used_mean",
-                "_dbg_gate_mean",
-                "_dbg_z_mean",
-            ]
-            vals = []
-            for k in keys:
-                if k in tb_dict:
-                    vals.append(f"{k}={float(tb_dict[k].detach().item()):.6f}")
-            if len(vals) > 0:
-                print("TEMPDBG", " ".join(vals))
 
 
     epoch_avg_loss = sum_loss / max(n_loss, 1)
@@ -371,11 +369,14 @@ def train_phase(
     #     warmup_epochs=warmup_epochs,
     # )
 
-    HEAD_LR_MULT = 0.2 
-    TEMPORAL_LR_MULT = 1.0
-    BACKBONE2D_LR_MULT = 0.05
+    HEAD_LR_MULT = 0.0
+    XMEM_LR_MULT = 1.0
+    ADAPTER_LR_MULT = 1.0
+    BACKBONE2D_LR_MULT = 0.0
+
     group_specs = [
-        (("xmem", "motion_transform_net", "aux_head", "temporal_fusion", "state_gate", "state_cand"), TEMPORAL_LR_MULT),
+        (("xmem",), XMEM_LR_MULT),
+        (("hidden_to_bev",), ADAPTER_LR_MULT),
         (("dense_head",), HEAD_LR_MULT),
         (("backbone_2d",), BACKBONE2D_LR_MULT),
     ]
@@ -436,7 +437,7 @@ def train_phase(
             max_grad_norm=10.0,
             alpha_temporal=alpha,
             supervise_det=True,
-            supervise_aux=True,
+            supervise_aux=False,
         )
 
         ckpt_path = os.path.join("log", f"phase_ckpt_epoch_{epoch + 1}.pth")
@@ -541,7 +542,6 @@ def main():
         PHASE1_PREFIXES = (
             "xmem",
             "hidden_to_bev",
-            "dense_head",
         )
 
         train_phase(
@@ -554,14 +554,14 @@ def main():
             device=device,
             resume_blob=resume_blob,
             start_epoch=start_epoch,
-            epochs=6,
-            lr_start=5e-5,
-            lr_max=5e-4,
-            lr_end=5e-6,
-            warmup_epochs=1,
+            epochs=7,
+            lr_start=1e-5,
+            lr_max=3e-4,
+            lr_end=3e-6,
+            warmup_epochs=2,
             alpha_start=0.0,
             alpha_end=1.0,
-            alpha_ramp_epochs=6,
+            alpha_ramp_epochs=5,
         )
         return
 

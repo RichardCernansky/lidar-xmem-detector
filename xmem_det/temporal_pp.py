@@ -20,21 +20,14 @@ class TemporalPointPillar(PointPillar):
         )
 
         self.pc_range = pc_range
-        self.motion_transform_net = nn.Conv2d(self.xmem.hidden_dim + 6, self.xmem.hidden_dim, 3, padding=1)
+        # self.motion_transform_net = nn.Conv2d(self.xmem.hidden_dim + 6, self.xmem.hidden_dim, 3, padding=1)
 
         mid = max(self.xmem.hidden_dim // 2, 1)
-        self.aux_head = nn.Sequential(
-            nn.Conv2d(self.xmem.hidden_dim, mid, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(mid, 6, 3, padding=1),
-        )
 
         self.aux_weight = 1.0
         self.hidden_prev = None
 
         D = self.xmem.hidden_dim
-        self.state_gate = nn.Conv2d(2 * D, D, kernel_size=1)
-        self.state_cand = nn.Conv2d(2 * D, D, kernel_size=3, padding=1)
 
 
         self.hidden_to_bev = nn.Conv2d(self.xmem.hidden_dim, c_bev, kernel_size=1)
@@ -160,6 +153,55 @@ class TemporalPointPillar(PointPillar):
         grid = F.affine_grid(theta, size=(B, 1, H, W), align_corners=False)
         return F.grid_sample(mask_prev, grid, mode=mode, padding_mode="zeros", align_corners=False)
 
+    def _transform_feat(self, x: torch.Tensor, T_rel: torch.Tensor, mode: str = "bilinear"):
+        if x is None or T_rel is None:
+            return x
+
+        if T_rel.dim() == 2:
+            T_rel = T_rel.unsqueeze(0)
+
+        B = x.size(0)
+        if T_rel.size(0) == 1 and B > 1:
+            T_rel = T_rel.expand(B, -1, -1)
+        if T_rel.size(0) != B:
+            raise ValueError(f"T_rel batch {T_rel.size(0)} != x batch {B}")
+
+        H, W = x.shape[-2], x.shape[-1]
+
+        if T_rel.size(-1) == 4:
+            R = T_rel[:, :2, :2]
+            t = T_rel[:, :2, 3]
+        else:
+            R = T_rel[:, :2, :2]
+            t = T_rel[:, :2, 2]
+
+        R_inv = torch.inverse(R)
+        t_inv = -(R_inv @ t.unsqueeze(-1)).squeeze(-1)
+
+        x_min, y_min, _, x_max, y_max, _ = self.pc_range
+        sx = float(x_max - x_min)
+        sy = float(y_max - y_min)
+        cx = (x_min + x_max) * 0.5
+        cy = (y_min + y_max) * 0.5
+
+        r11 = R_inv[:, 0, 0]
+        r12 = R_inv[:, 0, 1]
+        r21 = R_inv[:, 1, 0]
+        r22 = R_inv[:, 1, 1]
+        tx = t_inv[:, 0]
+        ty = t_inv[:, 1]
+
+        theta = torch.zeros(B, 2, 3, device=x.device, dtype=x.dtype)
+        theta[:, 0, 0] = r11
+        theta[:, 0, 1] = r12 * (sy / sx)
+        theta[:, 1, 0] = r21 * (sx / sy)
+        theta[:, 1, 1] = r22
+        theta[:, 0, 2] = (2.0 / sx) * (r11 * cx + r12 * cy + tx - cx)
+        theta[:, 1, 2] = (2.0 / sy) * (r21 * cx + r22 * cy + ty - cy)
+
+        grid = F.affine_grid(theta, size=(B, x.size(1), H, W), align_corners=False)
+        return F.grid_sample(x, grid, mode=mode, padding_mode="zeros", align_corners=False)
+
 
     def detach_temporal_state(self):
         if isinstance(self.hidden_prev, torch.Tensor):
@@ -211,6 +253,18 @@ class TemporalPointPillar(PointPillar):
                 else:
                     scene_mask = self._build_scene_mask_from_bev(bev)
 
+                if t_seq > 0 and T_rel is not None and hasattr(self.xmem, "mms") and len(self.xmem.mms) > 0:
+                    for mm in self.xmem.mms:
+                        h = mm.get_hidden()
+                        if h is None:
+                            continue
+                        h2 = h.squeeze(1)
+                        T_rel_h = T_rel.to(device=h2.device, dtype=h2.dtype)
+                        h2w = self._transform_feat(h2, T_rel_h, mode="bilinear")
+                        h_warped = h2w.unsqueeze(1)
+                        mm.set_hidden(h_warped if keep_state_grad else h_warped.detach())
+
+
                 occ_logits, hidden_cur = self.xmem.forward_step(
                     t_seq,
                     bev,
@@ -220,7 +274,18 @@ class TemporalPointPillar(PointPillar):
 
                 a = float(alpha_temporal)
                 temp = self.hidden_to_bev(hidden_cur)
-                batch_dict["spatial_features_2d"] = bev + a * temp
+                bev_fused = bev + a * temp
+                batch_dict["spatial_features_2d"] = bev_fused
+
+                bev_l1 = bev.detach().abs().mean()
+                temp_l1 = (temp.detach().abs().mean() * float(a))
+                delta_l1 = (bev_fused.detach() - bev.detach()).abs().mean()
+
+                batch_dict["_dbg_s"] = torch.tensor(float(a), device=bev.device)
+                batch_dict["_dbg_bev_l1"] = bev_l1
+                batch_dict["_dbg_temp_l1_scaled"] = temp_l1
+                batch_dict["_dbg_temp_ratio"] = temp_l1 / (bev_l1 + 1e-6)
+                batch_dict["_dbg_delta_ratio"] = delta_l1 / (bev_l1 + 1e-6)
 
 
                 # if t_seq > 0 and self.hidden_prev is not None and T_rel is not None:
@@ -279,26 +344,6 @@ class TemporalPointPillar(PointPillar):
                 loss = loss_det
                 if aux_loss is not None:
                     loss = loss + self.aux_weight * aux_loss
-
-            if aux_loss is not None:
-                tb_dict["aux_motion_tf"] = aux_loss.detach()
-
-            for k in [
-                "_dbg_gate_mean",
-                "_dbg_gate_used_mean",
-                "_dbg_hidden_used_l1",
-                "_dbg_bev_l1",
-                "_dbg_hidden_to_bev",
-                "_dbg_prior_l1",
-                "_dbg_hidden_cur_l1",
-                "_dbg_z_mean",
-                "_dbg_bev_delta",
-                "_dbg_temporal_delta",
-                "_dbg_hidden_prev_has_fn",
-                "_dbg_alpha",
-            ]:
-                if k in batch_dict:
-                    tb_dict[k] = batch_dict[k]
 
 
             return {"loss": loss}, tb_dict, disp_dict, det_masks_next

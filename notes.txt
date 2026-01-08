@@ -137,9 +137,18 @@ Temporal + Ego-Compensation:
 
 
 EVAL
-python eval.py   --cfg_file xmem_det/configs/temporal_pp_xmem_nuscenes.yaml   --xmem_cfg xmem_det/configs/xmem.yaml  --ckpt log/phase1_ckpt_epoch_6.pth   --split val   --seq_len 8   --stride 8   --alpha 1.0   --workers 4   --log_interval 100   --extra_tag default   --eval_tag win8_stride8
-
-python eval.py --cfg_file xmem_det/configs/temporal_pp_xmem_nuscenes.yaml --xmem_cfg xmem_det/configs/xmem.yaml --ckpt log/phase1_ckpt_epoch_7.pth --split val --seq_len 8 --alpha 1.0 --log_interval 100 --extra_tag default --eval_tag opt1_seq8_val
+python eval.py   --cfg_file xmem_det/configs/temporal_pp_xmem_nuscenes.yaml   --xmem_cfg xmem_det/configs/xmem.yaml  --ckpt log/phase_ckpt_epoch_6.pth   --split val   --seq_len 8   --alpha 1.0   --workers 4   --log_interval 100   --extra_tag default   --eval_tag epoch_6
 
 
 
+PRIMITIVE MODEL TEMP DBG
+TEMPDBG _dbg_alpha=0.833333 _dbg_hidden_prev_has_fn=1.000000 _dbg_hidden_to_bev=0.082321 _dbg_temporal_delta=0.000259 _dbg_bev_delta=0.093399 _dbg_gate_used_mean=0.406820 _dbg_gate_mean=0.288183 _dbg_z_mean=0.499891
+ TEMPDBG _dbg_alpha=0.833333 _dbg_hidden_prev_has_fn=1.000000 _dbg_hidden_to_bev=0.087886 _dbg_temporal_delta=0.000274 _dbg_bev_delta=0.092724 _dbg_gate_used_mean=0.402903 _dbg_gate_mean=0.283483 _dbg_z_mean=0.499912 
+ TEMPDBG _dbg_alpha=0.833333 _dbg_hidden_prev_has_fn=1.000000 _dbg_hidden_to_bev=0.079963 _dbg_temporal_delta=0.000236 _dbg_bev_delta=0.089846 _dbg_gate_used_mean=0.404105 _dbg_gate_mean=0.284926 _dbg_z_mean=0.499951
+  TEMPDBG _dbg_alpha=0.833333 _dbg_hidden_prev_has_fn=1.000000 _dbg_hidden_to_bev=0.084058 _dbg_temporal_delta=0.000257 _dbg_bev_delta=0.090435 _dbg_gate_used_mean=0.406472 _dbg_gate_mean=0.287767 _dbg_z_mean=0.499894
+   TEMPDBG _dbg_alpha=0.833333 _dbg_hidden_prev_has_fn=1.000000 _dbg_hidden_to_bev=0.080737 _dbg_temporal_delta=0.000252 _dbg_bev_delta=0.092436 _dbg_gate_used_mean=0.404592 _dbg_gate_mean=0.285510 _dbg_z_mean=0.499919 
+   TEMPDBG _dbg_alpha=0.833333 _dbg_hidden_prev_has_fn=1.000000 _dbg_hidden_to_bev=0.093393 _dbg_temporal_delta=0.000227 _dbg_bev_delta=0.074748 _dbg_gate_used_mean=0.400570 _dbg_gate_mean=0.280684 _dbg_z_mean=0.499957
+  TEMPDBG _dbg_alpha=0.833333 _dbg_hidden_prev_has_fn=1.000000 _dbg_hidden_to_bev=0.085690 _dbg_temporal_delta=0.000256 _dbg_bev_delta=0.088246 _dbg_gate_used_mean=0.413788 _dbg_gate_mean=0.296546 _dbg_z_mean=0.499891 
+  TEMPDBG _dbg_alpha=0.833333 _dbg_hidden_prev_has_fn=1.000000 _dbg_hidden_to_bev=0.083921 _dbg_temporal_delta=0.000252 _dbg_bev_delta=0.088531 _dbg_gate_used_mean=0.417001 _dbg_gate_mean=0.300401 _dbg_z_mean=0.499891 
+  TEMPDBG _dbg_alpha=0.833333 _dbg_hidden_prev_has_fn=1.000000 _dbg_hidden_to_bev=0.085357 _dbg_temporal_delta=0.000273 _dbg_bev_delta=0.093992 _dbg_gate_used_mean=0.407228 _dbg_gate_mean=0.288673 _dbg_z_mean=0.499883
+   TEMPDBG _dbg_alpha=0.833333 _dbg_hidden_prev_has_fn=1.000000 _dbg_hidden_to_bev=0.082718 _dbg_temporal_delta=0.000263 _dbg_bev_delta=0.094137 _dbg_gate_used_mean=0.406027 _dbg_gate_mean=0.287232 _dbg_z_mean=0.499897
