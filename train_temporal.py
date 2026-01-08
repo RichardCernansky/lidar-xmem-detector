@@ -16,6 +16,8 @@ from pcdet.utils import common_utils
 
 from xmem_det.util import load_xmem_train_cfg
 
+
+
 def set_trainable_prefixes(model, prefixes):
     prefixes = tuple(prefixes)
     for n, p in model.named_parameters():
@@ -74,11 +76,15 @@ def build_seq_loader(cfg, logger, workers, seq_len, stride):
 
     return train_set, train_loader
 
+
 from collections import deque
+import torch
+from torch.nn.utils import clip_grad_norm_
+
 def train_one_epoch(
     model,
     optimizer,
-    scheduler,
+   scheduler,
     train_loader,
     epoch,
     total_epochs,
@@ -92,21 +98,32 @@ def train_one_epoch(
 ):
     model.train()
 
-    from collections import deque
     w = 200
     w_loss = deque(maxlen=w)
+    w_det = deque(maxlen=w)
+    w_occ = deque(maxlen=w)
+    w_cons = deque(maxlen=w)
+
     w_cls = deque(maxlen=w)
     w_loc = deque(maxlen=w)
     w_dir = deque(maxlen=w)
     w_aux = deque(maxlen=w)
 
     sum_loss = 0.0
+    sum_det = 0.0
+    sum_occ = 0.0
+    sum_cons = 0.0
+
     sum_cls = 0.0
     sum_loc = 0.0
     sum_dir = 0.0
     sum_aux = 0.0
 
     n_loss = 0
+    n_det = 0
+    n_occ = 0
+    n_cons = 0
+
     n_cls = 0
     n_loc = 0
     n_dir = 0
@@ -153,8 +170,6 @@ def train_one_epoch(
                     det_instance_masks_prev=det_instance_masks_prev,
                     T_rel=T_rel,
                     alpha_temporal=alpha_temporal,
-                    compute_det_loss=False,
-                    compute_aux_loss=False,
                     keep_state_grad=False,
                 )
 
@@ -180,8 +195,6 @@ def train_one_epoch(
                 det_instance_masks_prev=det_instance_masks_prev,
                 T_rel=T_rel,
                 alpha_temporal=alpha_temporal,
-                compute_det_loss=False,
-                compute_aux_loss=False,
                 keep_state_grad=True,
             )
 
@@ -198,14 +211,17 @@ def train_one_epoch(
             T_rel_np = rel_T_curr_prev(T_world_lidar, t_last)
             T_rel = torch.from_numpy(T_rel_np).to(device, non_blocking=True)
 
+        batch_dict["_vis"] = (seq_idx % 10 == 0)
+        batch_dict["_vis_dir"] = "log/vis"
+        batch_dict["_vis_tag"] = f"ep{epoch+1}_seq{seq_idx:05d}"
+        batch_dict["_vis_b"] = 0
+
         ret_dict, tb_dict, disp_dict, det_masks_last = model(
             batch_dict,
             t_seq=t_last,
             det_instance_masks_prev=det_instance_masks_prev,
             T_rel=T_rel,
             alpha_temporal=alpha_temporal,
-            compute_det_loss=bool(supervise_det),
-            compute_aux_loss=bool(supervise_aux),
             keep_state_grad=True,
         )
 
@@ -213,29 +229,30 @@ def train_one_epoch(
 
         optimizer.zero_grad()
         loss.backward()
-        # print(torch.cuda.max_memory_allocated() / (1024**2))
-
-        # def grad_norm(m):
-        #     s = 0.0
-        #     for p in m.parameters():
-        #         if p.grad is not None:
-        #             s += float(p.grad.detach().norm().item())
-        #     return s
-
-        # print("state_gate", grad_norm(model.state_gate))
-        # print("state_cand", grad_norm(model.state_cand))
-        # print("motion_tf", grad_norm(model.motion_transform_net))
-
-
         clip_grad_norm_(model.parameters(), max_grad_norm)
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
 
-        loss_v = _to_float(loss)
-        w_loss.append(loss_v)
-        sum_loss += loss_v
+        loss_total_v = _to_float(tb_dict.get("loss_total", loss))
+        loss_det_v = _to_float(tb_dict.get("loss_det", 0.0))
+        loss_occ_v = _to_float(tb_dict.get("loss_aux_occ", 0.0))
+        loss_cons_v = _to_float(tb_dict.get("loss_aux_cons", 0.0))
+
+        w_loss.append(loss_total_v)
+        w_det.append(loss_det_v)
+        w_occ.append(loss_occ_v)
+        w_cons.append(loss_cons_v)
+
+        sum_loss += loss_total_v
+        sum_det += loss_det_v
+        sum_occ += loss_occ_v
+        sum_cons += loss_cons_v
+
         n_loss += 1
+        n_det += 1
+        n_occ += 1
+        n_cons += 1
 
         if "rpn_loss_cls" in tb_dict:
             v = _to_float(tb_dict["rpn_loss_cls"])
@@ -265,6 +282,10 @@ def train_one_epoch(
             lr = optimizer.param_groups[0]["lr"]
 
             win_loss = _avg(w_loss)
+            win_det = _avg(w_det)
+            win_occ = _avg(w_occ)
+            win_cons = _avg(w_cons)
+
             win_cls = _avg(w_cls)
             win_loc = _avg(w_loc)
             win_dir = _avg(w_dir)
@@ -272,7 +293,8 @@ def train_one_epoch(
 
             loss_str = (
                 f"epoch {epoch + 1}/{total_epochs}, seq {seq_idx + 1}/{len(train_loader)}, "
-                f"loss {loss_v:.4f}, win200 {win_loss:.4f}, "
+                f"loss {loss_total_v:.4f}, det {loss_det_v:.4f}, occ {loss_occ_v:.4f}, cons {loss_cons_v:.4f}, "
+                f"win200 loss {win_loss:.4f}, det {win_det:.4f}, occ {win_occ:.4f}, cons {win_cons:.4f}, "
             )
 
             if "rpn_loss_cls" in tb_dict:
@@ -302,10 +324,15 @@ def train_one_epoch(
             loss_str += f"lr {lr:.6e}"
             logger.info(loss_str)
 
-
-
     epoch_avg_loss = sum_loss / max(n_loss, 1)
-    msg = f"epoch {epoch + 1}/{total_epochs} summary: avg_loss {epoch_avg_loss:.4f}"
+    msg = (
+        f"epoch {epoch + 1}/{total_epochs} summary: "
+        f"avg_total {epoch_avg_loss:.4f}, "
+        f"avg_det {sum_det / max(n_det, 1):.4f}, "
+        f"avg_occ {sum_occ / max(n_occ, 1):.4f}, "
+        f"avg_cons {sum_cons / max(n_cons, 1):.4f}"
+    )
+
     if n_cls > 0:
         msg += f", avg_cls {sum_cls / n_cls:.4f}"
     if n_loc > 0:
@@ -314,11 +341,19 @@ def train_one_epoch(
         msg += f", avg_dir {sum_dir / n_dir:.4f}"
     if n_aux > 0:
         msg += f", avg_aux {sum_aux / n_aux:.4f}"
+
     if len(w_loss) > 0:
-        msg += f", win200_loss {_avg(w_loss):.4f}"
-    if len(w_aux) > 0:
-        msg += f", win200_aux {_avg(w_aux):.4f}"
+        msg += f", win200_total {_avg(w_loss):.4f}"
+    if len(w_det) > 0:
+        msg += f", win200_det {_avg(w_det):.4f}"
+    if len(w_occ) > 0:
+        msg += f", win200_occ {_avg(w_occ):.4f}"
+    if len(w_cons) > 0:
+        msg += f", win200_cons {_avg(w_cons):.4f}"
+
     logger.info(msg)
+
+
 
 
 
@@ -354,20 +389,6 @@ def train_phase(
 
 
     set_trainable_prefixes(model, prefixes)
-
-    # optimizer = build_optimizer_trainable_only(model, cfg, lr=lr_start)
-
-    # steps_per_epoch = len(train_loader)
-
-    # scheduler = build_warmup_cosine_scheduler(
-    #     optimizer=optimizer,
-    #     steps_per_epoch=steps_per_epoch,
-    #     epochs=epochs,
-    #     lr_start=lr_start,
-    #     lr_max=lr_max,
-    #     lr_end=lr_end,
-    #     warmup_epochs=warmup_epochs,
-    # )
 
     HEAD_LR_MULT = 0.0
     XMEM_LR_MULT = 1.0
@@ -506,6 +527,8 @@ def main():
     num_class = len(cfg.CLASS_NAMES)
     pc_range = cfg.DATA_CONFIG.POINT_CLOUD_RANGE
 
+    
+
     model = TemporalPointPillar(
         model_cfg=cfg.MODEL,
         num_class=num_class,
@@ -554,14 +577,15 @@ def main():
             device=device,
             resume_blob=resume_blob,
             start_epoch=start_epoch,
-            epochs=7,
-            lr_start=1e-5,
-            lr_max=3e-4,
-            lr_end=3e-6,
+            epochs=8,
+            lr_start=2e-6,
+            lr_max=2e-4,
+            lr_end=2e-6,
             warmup_epochs=2,
             alpha_start=0.0,
-            alpha_end=1.0,
-            alpha_ramp_epochs=5,
+            alpha_end=0.2,
+            alpha_ramp_epochs=8
+
         )
         return
 
@@ -586,14 +610,14 @@ def main():
             device=device,
             resume_blob=resume_blob,
             start_epoch=start_epoch,
-            epochs=18,
-            lr_start=5e-5,
-            lr_max=1e-4,
-            lr_end=5e-7,
+            epochs=12,
+            lr_start=5e-6,
+            lr_max=5e-5,
+            lr_end=1e-6,
             warmup_epochs=1,
-            alpha_start=0.0,
+            alpha_start=0.2,
             alpha_end=1.0,
-            alpha_ramp_epochs=12
+            alpha_ramp_epochs=10,
         )
 
 

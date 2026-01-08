@@ -17,7 +17,7 @@ from xmem_det.temporal_pp import TemporalPointPillar
 from xmem_det.util import load_xmem_train_cfg
 
 def deduce_alpha_from_ckpt_if_possible(blob: dict, fallback: float) -> float:
-    return 0
+    # return 0
     if not isinstance(blob, dict):
         return float(fallback)
 
@@ -333,8 +333,7 @@ def main():
                 We reset sequence state for each rolling window so evaluation is deterministic
                 and reflects "using only the past context up to seq_len".
                 """
-                if hasattr(model, "reset_sequence"):
-                    model.reset_sequence(win_id)
+                model.reset_sequence(win_id)
 
                 det_instance_masks_prev = None
                 T_world_prev = None

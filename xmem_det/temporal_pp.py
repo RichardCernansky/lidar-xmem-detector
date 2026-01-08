@@ -6,6 +6,7 @@ from pcdet.models.detectors.pointpillar import PointPillar
 from xmem_det.xmem_wrapper import XMemBackboneWrapper
 from xmem_det.util import boxes_to_bev_masks
 
+from xmem_det.debug_vis import dump_temporal_debug
 
 class TemporalPointPillar(PointPillar):
     def __init__(self, model_cfg, num_class, dataset, xmem_train_cfg, pc_range):
@@ -24,16 +25,19 @@ class TemporalPointPillar(PointPillar):
 
         mid = max(self.xmem.hidden_dim // 2, 1)
 
-        self.aux_weight = 1.0
         self.hidden_prev = None
 
         D = self.xmem.hidden_dim
 
+        self.occ_prev = None
+        self.aux_occ_w = 0.5
+        self.aux_cons_w = 0.1
 
         self.hidden_to_bev = nn.Conv2d(self.xmem.hidden_dim, c_bev, kernel_size=1)
 
     def reset_sequence(self, seq_id: int):
         self.xmem.clear_memory()
+        self.occ_prev = None
         self.hidden_prev = None
 
     def _build_scene_mask_from_bev(self, spatial_features_2d: torch.Tensor):
@@ -232,11 +236,10 @@ class TemporalPointPillar(PointPillar):
         det_instance_masks_prev: torch.Tensor = None,
         T_rel: torch.Tensor = None,
         alpha_temporal: float = 1.0,
-        compute_det_loss: bool = True,
-        compute_aux_loss: bool = True,
         keep_state_grad: bool = False,
     ):
-        aux_loss = None
+        aux_occ_loss = None
+        aux_cons_loss = None
 
         for cur_module in self.module_list:
             batch_dict = cur_module(batch_dict)
@@ -245,8 +248,12 @@ class TemporalPointPillar(PointPillar):
                 bev = batch_dict["spatial_features_2d"]
                 H, W = bev.shape[-2], bev.shape[-1]
 
+                det_prev_raw = det_instance_masks_prev
+                det_prev_warped = det_instance_masks_prev
                 if t_seq > 0 and det_instance_masks_prev is not None and T_rel is not None:
-                    det_instance_masks_prev = self._transform_mask(det_instance_masks_prev, T_rel, H, W, mode="nearest")
+                    det_prev_warped = self._transform_mask(det_instance_masks_prev, T_rel, H, W, mode="nearest")
+                    det_instance_masks_prev = det_prev_warped
+
 
                 if det_instance_masks_prev is not None:
                     scene_mask = (det_instance_masks_prev.sum(dim=1, keepdim=True) > 0).float()
@@ -264,50 +271,72 @@ class TemporalPointPillar(PointPillar):
                         h_warped = h2w.unsqueeze(1)
                         mm.set_hidden(h_warped if keep_state_grad else h_warped.detach())
 
-
+                aux_occ = None
+                aux_cons = None
                 occ_logits, hidden_cur = self.xmem.forward_step(
                     t_seq,
                     bev,
                     scene_mask=scene_mask,
                     keep_state_grad=keep_state_grad,
+                      history_mode="full",
                 )
+
+                if occ_logits is not None and occ_logits.dim() == 3:
+                    occ_logits = occ_logits.unsqueeze(1)
+                occ_prob = torch.sigmoid(occ_logits) if occ_logits is not None else None
+                target = scene_mask.detach().to(dtype=bev.dtype)
+
+                # compute aux loss
+                if self.training and occ_logits is not None and target is not None:
+                    pos = target.mean().clamp(1e-4, 1 - 1e-4)
+                    pos_weight = ((1 - pos) / pos).to(device=occ_logits.device, dtype=occ_logits.dtype)
+                    aux_occ = F.binary_cross_entropy_with_logits(
+                        occ_logits,
+                        target.to(dtype=occ_logits.dtype),
+                        pos_weight=pos_weight,
+                    )
+                if self.training and occ_prob is not None and self.occ_prev is not None and T_rel is not None:
+                    prev_w = self._transform_mask(self.occ_prev, T_rel, H, W, mode="bilinear")
+                    aux_cons = (occ_prob - prev_w.detach()).abs().mean()
+                if occ_prob is not None:
+                    self.occ_prev = occ_prob.detach()
+                aux_occ_loss = aux_occ
+                aux_cons_loss = aux_cons            
 
                 a = float(alpha_temporal)
                 temp = self.hidden_to_bev(hidden_cur)
-                bev_fused = bev + a * temp
+
+                bev_scale = bev.detach().abs().mean(dim=1, keepdim=True)
+                temp_scale = temp.detach().abs().mean(dim=1, keepdim=True)
+                temp = temp * (bev_scale / (temp_scale + 1e-6))
+
+                if occ_prob is None:
+                    gate = scene_mask
+                else:
+                    # If gate is detached forever and occ_prob is trained only on pseudo-labels, it may become a smooth mask that doesn’t align with real objects well enough to help.
+
+                    # Fix later: once stable, allow some gradient through gate (or make gate depend on both occ and BEV), but only after it stops collapsing.
+                    # A) Gate collapse / shortcut
+
+                    # If gate is detached forever and occ_prob is trained only on pseudo-labels, it may become a smooth mask that doesn’t align with real objects well enough to help.
+
+                    # Fix later: once stable, allow some gradient through gate (or make gate depend on both occ and BEV), but only after it stops collapsing.
+
+                    # B) temp just mirrors BEV
+
+                    # If hidden_to_bev(hidden_cur) learns to reproduce BEV-like patterns, the branch is mostly redundant. It might still help as a mild denoiser, but not much.
+
+                    # How to detect: corr(temp_mag, bev_mag) is very high; delta_ratio stays high without improving det metrics.
+
+                    # C) Injection overwhelms baseline
+
+                    # If delta_ratio is consistently large (e.g. >0.5), you’re changing BEV too much; the detector becomes unstable.
+                    gate = 0.2 + 0.8 * occ_prob
+                    if self.training:
+                        gate = gate.detach()
+
+                bev_fused = bev + a * gate * temp
                 batch_dict["spatial_features_2d"] = bev_fused
-
-                bev_l1 = bev.detach().abs().mean()
-                temp_l1 = (temp.detach().abs().mean() * float(a))
-                delta_l1 = (bev_fused.detach() - bev.detach()).abs().mean()
-
-                batch_dict["_dbg_s"] = torch.tensor(float(a), device=bev.device)
-                batch_dict["_dbg_bev_l1"] = bev_l1
-                batch_dict["_dbg_temp_l1_scaled"] = temp_l1
-                batch_dict["_dbg_temp_ratio"] = temp_l1 / (bev_l1 + 1e-6)
-                batch_dict["_dbg_delta_ratio"] = delta_l1 / (bev_l1 + 1e-6)
-
-
-                # if t_seq > 0 and self.hidden_prev is not None and T_rel is not None:
-                #     motion_gt = self._motion6_map(T_rel, H, W, bev.device, bev.dtype)
-                #     prior_to_cur = self.motion_transform_net(torch.cat([self.hidden_prev, motion_gt], dim=1))
-                # else:
-                #     prior_to_cur = torch.zeros_like(hidden_cur)
-
-                # u = torch.cat([hidden_cur, prior_to_cur], dim=1)
-                # z = torch.sigmoid(self.state_gate(u))
-                # h_tilde = torch.tanh(self.state_cand(u))
-                # hidden_out = (1.0 - z) * prior_to_cur + z * h_tilde
-                # batch_dict["spatial_features_2d"] = self.hidden_to_bev(hidden_out)
-                
-                # if self.training and compute_aux_loss and t_seq > 0 and self.hidden_prev is not None and T_rel is not None:
-                #     motion_gt = self._motion6_map(T_rel, H, W, bev.device, bev.dtype).detach()
-                #     motion_pred = self.aux_head(prior_to_cur)
-                #     valid_area = self._build_scene_mask_from_bev(bev).detach()
-                #     diff = torch.abs(motion_pred - motion_gt)
-                #     aux_loss = (diff * valid_area).sum() / (valid_area.sum() + 1e-6)
-
-                # self.hidden_prev = hidden_out if keep_state_grad else hidden_out.detach()
 
 
         if self.training:
@@ -315,8 +344,7 @@ class TemporalPointPillar(PointPillar):
             tb_dict = {}
             disp_dict = {}
 
-            if compute_det_loss:
-                loss_det, tb_dict, disp_dict = self.get_training_loss()
+            loss_det, tb_dict, disp_dict = self.get_training_loss()
 
             fwd_ret = self.dense_head.forward_ret_dict
             batch_cls_preds, batch_box_preds = self.dense_head.generate_predicted_boxes(
@@ -337,16 +365,47 @@ class TemporalPointPillar(PointPillar):
 
             pred_dicts, _ = self.post_processing(batch_dict)
             det_masks_next = self._build_det_masks(pred_dicts, batch_dict)
+            dump_temporal_debug(
+                batch_dict=batch_dict,
+                t_seq=t_seq,
+                bev=bev,
+                bev_fused=batch_dict["spatial_features_2d"],
+                temp=temp,
+                hidden_cur=hidden_cur,
+                occ_logits=occ_logits,
+                det_prev_raw=det_prev_raw,
+                det_prev_warped=det_prev_warped,
+                scene_mask=scene_mask,
+                det_next=det_masks_next,
+                frames_img=self.xmem.bev_adapter(bev),
+            )
 
-            if loss_det is None:
-                loss = self.aux_weight * aux_loss if aux_loss is not None else torch.zeros((), device=bev.device)
-            else:
-                loss = loss_det
-                if aux_loss is not None:
-                    loss = loss + self.aux_weight * aux_loss
+            loss_total = loss_det if loss_det is not None else torch.zeros((), device=batch_dict["spatial_features_2d"].device)
 
+            aux_occ_raw = aux_occ_loss
+            aux_cons_raw = aux_cons_loss
 
-            return {"loss": loss}, tb_dict, disp_dict, det_masks_next
+            aux_occ_w = None
+            aux_cons_w = None
+
+            if aux_occ_raw is not None:
+                aux_occ_w = self.aux_occ_w * aux_occ_raw
+                loss_total = loss_total + aux_occ_w
+
+            if aux_cons_raw is not None:
+                aux_cons_w = self.aux_cons_w * aux_cons_raw
+                loss_total = loss_total + aux_cons_w
+
+            dev = batch_dict["spatial_features_2d"].device
+
+            tb_dict["loss_det"] = loss_det.detach() if loss_det is not None else torch.zeros((), device=dev)
+            tb_dict["loss_aux_occ"] = aux_occ_raw.detach() if aux_occ_raw is not None else torch.zeros((), device=dev)
+            tb_dict["loss_aux_cons"] = aux_cons_raw.detach() if aux_cons_raw is not None else torch.zeros((), device=dev)
+            tb_dict["loss_aux_occ_w"] = aux_occ_w.detach() if aux_occ_w is not None else torch.zeros((), device=dev)
+            tb_dict["loss_aux_cons_w"] = aux_cons_w.detach() if aux_cons_w is not None else torch.zeros((), device=dev)
+            tb_dict["loss_total"] = loss_total.detach()
+
+            return {"loss": loss_total}, tb_dict, disp_dict, det_masks_next
 
         pred_dicts, recall_dicts = self.post_processing(batch_dict)
         det_masks_next = self._build_det_masks(pred_dicts, batch_dict)
