@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
 from pcdet.models.detectors.pointpillar import PointPillar
 from xmem_det.xmem_wrapper import XMemBackboneWrapper
@@ -207,6 +208,76 @@ class TemporalPointPillar(PointPillar):
         return F.grid_sample(x, grid, mode=mode, padding_mode="zeros", align_corners=False)
 
 
+    def _get_gt_boxes_tensor(self, batch_dict):
+        for k in ("gt_boxes", "gt_boxes_lidar", "gt_boxes3d"):
+            v = batch_dict.get(k, None)
+            if v is None:
+                continue
+            if isinstance(v, torch.Tensor):
+                return v
+            if isinstance(v, (list, tuple)) and len(v) > 0 and isinstance(v[0], torch.Tensor):
+                return v[0]
+            if hasattr(v, "dtype") and hasattr(v, "shape"):
+                try:
+                    return torch.from_numpy(v)
+                except Exception:
+                    pass
+        return None
+
+    def _build_gt_occ_target(self, batch_dict, H: int, W: int):
+        gt = self._get_gt_boxes_tensor(batch_dict)
+        if gt is None:
+            return None
+
+        if isinstance(gt, np.ndarray):
+            gt = torch.from_numpy(gt)
+
+        if gt.dim() == 2:
+            gt = gt.unsqueeze(0)
+
+        dev = batch_dict["spatial_features_2d"].device
+        dtype = batch_dict["spatial_features_2d"].dtype
+        gt = gt.to(device=dev, dtype=dtype)
+
+        gt7 = gt[..., :7]
+
+        valid = (gt7[..., 3] > 0) & (gt7[..., 4] > 0) & (gt7[..., 5] > 0)
+        B = gt7.size(0)
+        nmax = int(valid.sum(dim=1).max().item())
+        if nmax == 0:
+            return torch.zeros(B, 1, H, W, device=dev, dtype=dtype)
+
+        boxes = torch.zeros(B, nmax, 7, device=dev, dtype=dtype)
+        for b in range(B):
+            idx = valid[b].nonzero(as_tuple=False).squeeze(1)
+            k = int(idx.numel())
+            if k > 0:
+                boxes[b, :k] = gt7[b, idx]
+
+        scores = torch.ones(B, nmax, device=dev, dtype=dtype)
+
+        occ = boxes_to_bev_masks(
+            boxes,
+            scores,
+            H,
+            W,
+            self.pc_range,
+            score_thresh=0.0,
+        )
+        if occ is None:
+            return torch.zeros(B, 1, H, W, device=dev, dtype=dtype)
+
+        if occ.dim() == 3:
+            occ = occ.unsqueeze(1)
+
+        if occ.dim() == 4 and occ.size(1) != 1:
+            occ = (occ.sum(dim=1, keepdim=True) > 0).to(dtype=dtype)
+        else:
+            occ = (occ > 0).to(dtype=dtype)
+
+        return occ
+
+
     def detach_temporal_state(self):
         if isinstance(self.hidden_prev, torch.Tensor):
             self.hidden_prev = self.hidden_prev.detach()
@@ -284,7 +355,13 @@ class TemporalPointPillar(PointPillar):
                 if occ_logits is not None and occ_logits.dim() == 3:
                     occ_logits = occ_logits.unsqueeze(1)
                 occ_prob = torch.sigmoid(occ_logits) if occ_logits is not None else None
-                target = scene_mask.detach().to(dtype=bev.dtype)
+
+                gt_occ = self._build_gt_occ_target(batch_dict, H, W)
+                if self.training and gt_occ is not None:
+                    target = gt_occ.detach().to(dtype=bev.dtype)
+                else:
+                    target = scene_mask.detach().to(dtype=bev.dtype)
+
 
                 # compute aux loss
                 if self.training and occ_logits is not None and target is not None:
@@ -378,6 +455,7 @@ class TemporalPointPillar(PointPillar):
                 scene_mask=scene_mask,
                 det_next=det_masks_next,
                 frames_img=self.xmem.bev_adapter(bev),
+                gt_occ=gt_occ,
             )
 
             loss_total = loss_det if loss_det is not None else torch.zeros((), device=batch_dict["spatial_features_2d"].device)

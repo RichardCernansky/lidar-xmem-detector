@@ -136,6 +136,7 @@ def train_one_epoch(
         return (sum(dq) / len(dq)) if len(dq) > 0 else None
 
     for seq_idx, seq in enumerate(train_loader):
+
         torch.cuda.reset_peak_memory_stats()
 
         frames = seq["frames"]
@@ -382,16 +383,14 @@ def train_phase(
         r = int(alpha_ramp_epochs)
         if r <= 0:
             return e
-        if epoch_idx >= r:
-            return e
-        x = (epoch_idx + 1) / r
+        x = (epoch_idx + 1 - start_epoch) / r
         return s + (e - s) * x
 
 
     set_trainable_prefixes(model, prefixes)
 
     HEAD_LR_MULT = 0.0
-    XMEM_LR_MULT = 1.0
+    XMEM_LR_MULT = 0.6
     ADAPTER_LR_MULT = 1.0
     BACKBONE2D_LR_MULT = 0.0
 
@@ -443,6 +442,7 @@ def train_phase(
 
     for epoch in range(start_epoch, total_epochs):
         alpha = alpha_ramp_epoch(epoch)
+        print("ALPHA", alpha)
         lr = optimizer.param_groups[0]["lr"]
         logger.info(f"Epoch {epoch + 1}/{total_epochs} alpha={alpha:.3f} lr={lr:.3e}")
 
@@ -576,7 +576,7 @@ def main():
             logger=logger,
             device=device,
             resume_blob=resume_blob,
-            start_epoch=start_epoch,
+            start_epoch=0,
             epochs=8,
             lr_start=2e-6,
             lr_max=2e-4,
@@ -609,15 +609,15 @@ def main():
             logger=logger,
             device=device,
             resume_blob=resume_blob,
-            start_epoch=start_epoch,
-            epochs=12,
+            start_epoch=8,
+            epochs=13,
             lr_start=5e-6,
-            lr_max=5e-5,
-            lr_end=1e-6,
+            lr_max=2e-4,
+            lr_end=2e-6,
             warmup_epochs=1,
             alpha_start=0.2,
-            alpha_end=1.0,
-            alpha_ramp_epochs=10,
+            alpha_end=0.6,
+            alpha_ramp_epochs=5,
         )
 
 

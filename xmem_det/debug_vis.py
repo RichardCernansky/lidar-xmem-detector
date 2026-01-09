@@ -86,7 +86,6 @@ def _save_grid(out_path: str, panels, titles, ncols: int = 3) -> None:
     plt.close(fig)
 
 
-
 def dump_temporal_debug(
     batch_dict: dict,
     t_seq: int,
@@ -100,6 +99,7 @@ def dump_temporal_debug(
     scene_mask: Optional[torch.Tensor],
     det_next: Optional[torch.Tensor],
     frames_img: Optional[torch.Tensor],
+    gt_occ: Optional[torch.Tensor] = None,
 ) -> None:
     if not bool(batch_dict.get("_vis", False)):
         return
@@ -143,6 +143,17 @@ def dump_temporal_debug(
     if occ_logits is not None:
         occ_prob = torch.sigmoid(occ_logits[b, 0])
 
+    gt = None
+    if gt_occ is not None:
+        if gt_occ.dim() == 4:
+            gt = gt_occ[b, 0]
+        elif gt_occ.dim() == 3:
+            gt = gt_occ[b]
+
+    occ_err = None
+    if occ_prob is not None and gt is not None:
+        occ_err = (occ_prob - gt).abs()
+
     rgb = None
     if frames_img is not None and frames_img.dim() == 4 and frames_img.shape[1] == 3:
         rgb = _to_numpy_rgb(frames_img[b])
@@ -153,8 +164,10 @@ def dump_temporal_debug(
         _norm01(_to_numpy_2d(delta_mag)),
         _norm01(_to_numpy_2d(bevf_mag)),
         _norm01(_to_numpy_2d(hid_mag)),
-         _norm01(_to_numpy_2d(hid_std)),
+        _norm01(_to_numpy_2d(hid_std)),
         None if occ_prob is None else _norm01(_to_numpy_2d(occ_prob)),
+        None if gt is None else _norm01(_to_numpy_2d(gt)),
+        None if occ_err is None else _norm01(_to_numpy_2d(occ_err)),
         None if m_prev_raw is None else _norm01(_to_numpy_2d(m_prev_raw)),
         None if m_prev_warp is None else _norm01(_to_numpy_2d(m_prev_warp)),
         None if m_next is None else _norm01(_to_numpy_2d(m_next)),
@@ -168,8 +181,10 @@ def dump_temporal_debug(
         "delta_mag",
         "bev_fused_mag",
         "hidden_mag",
-         "hidden_std",
+        "hidden_std",
         "occ_prob",
+        "gt_occ",
+        "occ_abs_err",
         "det_prev_raw",
         "det_prev_warped",
         "det_next",
@@ -179,3 +194,4 @@ def dump_temporal_debug(
 
     out_path = os.path.join(vis_dir, f"{vis_tag}_t{int(t_seq):03d}.png")
     _save_grid(out_path, panels, titles, ncols=3)
+
