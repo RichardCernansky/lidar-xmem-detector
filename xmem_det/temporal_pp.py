@@ -368,7 +368,7 @@ class TemporalPointPillar(PointPillar):
                         prev_w = self._transform_mask(self.occ_prev, T_rel, H, W, mode="bilinear")
                         scene_mask_xmem = (prev_w > prev_thr).to(dtype=bev.dtype)
                     else:
-                        scene_mask_xmem = scene_mask_gate
+                        scene_mask_xmem = scene_mask_xmem = torch.zeros(bev.size(0), 1, H, W, device=bev.device, dtype=bev.dtype)# change to only zeros
 
                 bev_xmem = bev
                 if occ_corrupt:
