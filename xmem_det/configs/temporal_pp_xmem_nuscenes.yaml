@@ -1,6 +1,6 @@
 ADDONS:
   RUN:
-    PHASE: "1"
+    PHASE: "0"
     DEVICE: "cuda"
 
     LOG_DIR: "log"
@@ -27,7 +27,7 @@ ADDONS:
 
   TRAIN_LOOP:
     STATS_WINDOW: 500
-    TBPTT_K: 8
+    TBPTT_K: 3 
     LOG_EVERY: 50
     MAX_GRAD_NORM: 10.0
 
@@ -40,6 +40,51 @@ ADDONS:
     XMEM_PREV_THR: 0.5
 
   PHASES:
+    "0":
+      PREFIXES: ["xmem"]
+
+      START_EPOCH: 0
+      END_EPOCH: 8
+
+      LR_START: 2e-6
+      LR_MAX: 2e-4
+      LR_END: 2e-6
+      WARMUP_EPOCHS: 2
+
+      ALPHA_START: 0.0
+      ALPHA_END: 0.0
+      ALPHA_RAMP_EPOCHS: 1 
+
+      PROB_SCHEDULE:
+        TEACHER:
+          START: 0.0
+          END: 0.0
+          RAMP_EPOCHS: 1 
+        CORRUPT:
+          START: 0.0
+          END: 0.0
+          RAMP_EPOCHS:  1 
+        TEACHER_LAST:
+          START: 0.0
+          END: 0.0
+          RAMP_EPOCHS:  1 
+        CORRUPT_LAST:
+          START: 0.0
+          END: 0.0
+          RAMP_EPOCHS:  1 
+
+      OPT_GROUP_SPECS:
+        - PREFIXES: ["xmem"]
+          LR_MULT: 0.6
+        - PREFIXES: ["hidden_to_bev"]
+          LR_MULT: 1.0
+        - PREFIXES: ["dense_head"]
+          LR_MULT: 0.0
+        - PREFIXES: ["backbone_2d"]
+          LR_MULT: 0.0
+
+      CKPT_NAME_TEMPLATE: "phase{phase}_{tag}_epoch_{epoch}.pth"
+
     "1":
       PREFIXES: ["xmem", "hidden_to_bev"]
 
@@ -339,7 +384,7 @@ OPTIMIZATION:
   MOMENTUM: 0.9
 
 TRAIN:
-  SEQ_LEN: 8
+  SEQ_LEN: 3 
   STRIDE: 4
   VAL_EVAL_INTERVAL: 1
   LOG_INTERVAL: 50

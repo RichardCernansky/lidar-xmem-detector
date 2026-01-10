@@ -289,7 +289,7 @@ def train_one_epoch(
             T_rel=T_rel,
             alpha_temporal=float(alpha_temporal),
             keep_state_grad=True,
-            compute_det_loss=True,
+            compute_det_loss=False,
             compute_aux_loss=True,
         )
 

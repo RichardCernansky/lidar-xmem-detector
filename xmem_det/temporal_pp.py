@@ -367,8 +367,10 @@ class TemporalPointPillar(PointPillar):
                 # if teacher forcing, use ground truth scene mask
                 if xmem_teacher:
                     scene_mask_xmem = scene_mask_gate
+                    # print("using GT occ mask for xmem")
                 # else use previous occ predictions
                 else:
+                    # print("using previous occ preds")
                     if (self.occ_prev is not None) and (T_rel is not None) and (t_seq > 0):
                         prev_w = self._transform_mask(self.occ_prev, T_rel, H, W, mode="bilinear")
                         scene_mask_xmem = (prev_w > prev_thr).to(dtype=bev.dtype)
