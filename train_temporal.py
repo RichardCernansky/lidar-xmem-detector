@@ -35,7 +35,7 @@ from config_utils import (
 )
 
 
-
+#return probability flag for stochastic decisions
 def sample_flag(p: float) -> bool:
     p = _require_prob_01("p", float(p))
     if p <= 0.0:
@@ -44,19 +44,19 @@ def sample_flag(p: float) -> bool:
         return True
     return bool(torch.rand((), device="cpu").item() < p)
 
-
+# set trainable parameters based on prefixes
 def set_trainable_prefixes(model, prefixes: List[str]) -> None:
     prefixes_t = tuple(prefixes)
     for n, p in model.named_parameters():
         p.requires_grad = n.startswith(prefixes_t)
 
-
+# get relative transform between current and previous frame
 def rel_T_curr_prev(T_world_lidar: np.ndarray, t: int) -> np.ndarray:
     T_prev = T_world_lidar[t - 1]
     T_curr = T_world_lidar[t]
     return (np.linalg.inv(T_curr) @ T_prev).astype(np.float32)
 
-
+# convert frame dict to torch batch dict
 def to_torch_batch_dict(frame_dict: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
     batch_dict: Dict[str, Any] = {}
     for k, v in frame_dict.items():
@@ -73,7 +73,7 @@ def to_torch_batch_dict(frame_dict: Dict[str, Any], device: torch.device) -> Dic
         batch_dict["batch_size"] = 1
     return batch_dict
 
-
+# build sequence data loader
 def build_seq_loader(cfg_obj, logger, workers_arg: int):
     seq_len = cfg_req_int(cfg_obj, "TRAIN.SEQ_LEN")
     stride = cfg_req_int(cfg_obj, "TRAIN.STRIDE")
@@ -114,7 +114,7 @@ def build_seq_loader(cfg_obj, logger, workers_arg: int):
 
     return train_set, train_loader
 
-
+# parse group specifications for optimizer
 def _parse_group_specs(specs: Any) -> List[Tuple[Tuple[str, ...], float]]:
     if not isinstance(specs, (list, tuple)) or len(specs) == 0:
         raise MissingConfigError("Missing or empty config key: ADDONS.PHASES.<phase>.OPT_GROUP_SPECS")
@@ -170,23 +170,26 @@ def train_one_epoch(
     stats = TrainStats(w=int(stats_window))
 
     for seq_idx, seq in enumerate(train_loader):
+        # get device
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats()
 
+        # get OpenPCDet batch dict
         frames = seq["frames"]
         T_world_lidar = seq["T_world_lidar"]
         T = len(frames)
         if T == 0:
             continue
-
+        # reset model temporal state if applicable
         if hasattr(model, "reset_sequence"):
             model.reset_sequence(seq_idx)
 
+        # inintialize 
         det_instance_masks_prev = None
-
         K = int(tbptt_k)
         burn = max(T - K, 0)
 
+        # DON'T USE burn-in phase (optionally with)
         for t in range(burn):
             frame = frames[t]
             batch_dict = to_torch_batch_dict(frame, device)
@@ -214,45 +217,55 @@ def train_one_epoch(
 
             if isinstance(det_instance_masks_prev, torch.Tensor):
                 det_instance_masks_prev = det_instance_masks_prev.detach()
-
+        # detach temporal state to avoid gradients through BURN-IN
         if hasattr(model, "detach_temporal_state"):
             model.detach_temporal_state()
 
+        aux_loss_sum = None
+        aux_steps = 0
+        # main training loop with TBPTT temporal gradients
         for t in range(burn, T - 1):
             frame = frames[t]
             batch_dict = to_torch_batch_dict(frame, device)
 
+            # sample stochastic FLAGS for this time step
             teacher_force = sample_flag(float(probs["p_teacher"]))
             if force_teacher_on_t0 and t == 0:
                 teacher_force = True
-
             batch_dict["_xmem_teacher"] = bool(teacher_force)
             batch_dict["_occ_corrupt"] = bool(sample_flag(float(probs["p_corrupt"])))
             batch_dict["_occ_drop_rate"] = float(occ_drop_rate)
             batch_dict["_occ_block"] = int(occ_block)
             batch_dict["_xmem_prev_thr"] = float(xmem_prev_thr)
 
+            # get relative transform
             if t == 0:
                 T_rel = None
             else:
                 T_rel = torch.from_numpy(rel_T_curr_prev(T_world_lidar, t)).to(device, non_blocking=True)
 
-            _, _, _, det_instance_masks_prev = model(
+
+            ret_mid, tb_mid, disp_mid, det_instance_masks_prev = model(
                 batch_dict,
                 t_seq=t,
                 det_instance_masks_prev=det_instance_masks_prev,
                 T_rel=T_rel,
                 alpha_temporal=float(alpha_temporal),
                 keep_state_grad=True,
+                compute_det_loss=False,
+                compute_aux_loss=True,
             )
+            step_aux_loss = ret_mid["loss"]
+            aux_loss_sum = step_aux_loss if aux_loss_sum is None else (aux_loss_sum + step_aux_loss)
+            aux_steps += 1
 
             if isinstance(det_instance_masks_prev, torch.Tensor):
                 det_instance_masks_prev = det_instance_masks_prev.detach()
 
+        # manage last time step separately (det loss)
         t_last = T - 1
         frame = frames[t_last]
         batch_dict = to_torch_batch_dict(frame, device)
-
         batch_dict["_xmem_teacher"] = bool(sample_flag(float(probs["p_teacher_last"])))
         batch_dict["_occ_corrupt"] = bool(sample_flag(float(probs["p_corrupt_last"])))
         batch_dict["_occ_drop_rate"] = float(occ_drop_rate)
@@ -276,10 +289,16 @@ def train_one_epoch(
             T_rel=T_rel,
             alpha_temporal=float(alpha_temporal),
             keep_state_grad=True,
+            compute_det_loss=True,
+            compute_aux_loss=True,
         )
 
         loss = ret_dict["loss"]
-
+        # reduce sum auxiliary loss with mean over TBPTT steps (length independent)
+        if aux_loss_sum is not None:
+                loss = loss + (aux_loss_sum / float(aux_steps))
+           
+        # backpropagate and step
         optimizer.zero_grad()
         loss.backward()
         clip_grad_norm_(model.parameters(), float(max_grad_norm))

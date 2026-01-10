@@ -207,7 +207,6 @@ class TemporalPointPillar(PointPillar):
         grid = F.affine_grid(theta, size=(B, x.size(1), H, W), align_corners=False)
         return F.grid_sample(x, grid, mode=mode, padding_mode="zeros", align_corners=False)
 
-
     def _get_gt_boxes_tensor(self, batch_dict):
         for k in ("gt_boxes", "gt_boxes_lidar", "gt_boxes3d"):
             v = batch_dict.get(k, None)
@@ -319,6 +318,8 @@ class TemporalPointPillar(PointPillar):
         T_rel: torch.Tensor = None,
         alpha_temporal: float = 1.0,
         keep_state_grad: bool = False,
+        compute_det_loss=None,
+        compute_aux_loss=None,
     ):
         aux_occ_loss = None
         aux_cons_loss = None
@@ -326,6 +327,7 @@ class TemporalPointPillar(PointPillar):
         for cur_module in self.module_list:
             batch_dict = cur_module(batch_dict)
 
+            # if current module is backbone_2d, apply xmem temporal fusion
             if cur_module is self.backbone_2d:
                 occ_logits = None
                 aux_occ = None
@@ -356,26 +358,32 @@ class TemporalPointPillar(PointPillar):
                 prev_thr = float(batch_dict.get("_xmem_prev_thr", 0.5))
                 # print("t_seq", t_seq, "xmem_teacher", xmem_teacher, "occ_corrupt", occ_corrupt, "prev_thr", prev_thr)
 
+                # build scene mask from previous detections or from bev
                 if det_instance_masks_prev is not None:
                     scene_mask_gate = (det_instance_masks_prev.sum(dim=1, keepdim=True) > 0).to(dtype=bev.dtype)
                 else:
                     scene_mask_gate = self._build_scene_mask_from_bev(bev).to(dtype=bev.dtype)
 
+                # if teacher forcing, use ground truth scene mask
                 if xmem_teacher:
                     scene_mask_xmem = scene_mask_gate
+                # else use previous occ predictions
                 else:
                     if (self.occ_prev is not None) and (T_rel is not None) and (t_seq > 0):
                         prev_w = self._transform_mask(self.occ_prev, T_rel, H, W, mode="bilinear")
                         scene_mask_xmem = (prev_w > prev_thr).to(dtype=bev.dtype)
                     else:
-                        scene_mask_xmem = scene_mask_xmem = torch.zeros(bev.size(0), 1, H, W, device=bev.device, dtype=bev.dtype)# change to only zeros
+                        # else use empty mask of zeros
+                        scene_mask_xmem = torch.zeros(bev.size(0), 1, H, W, device=bev.device, dtype=bev.dtype)
 
                 bev_xmem = bev
+                # if flag -> corrupt bev input for occ prediction augmentation
                 if occ_corrupt:
                     drop_rate = float(batch_dict.get("_occ_drop_rate", 0.5))
                     block = int(batch_dict.get("_occ_block", 8))
                     bev_xmem = self._bev_block_dropout(bev, drop_rate=drop_rate, block=block)
 
+                # get xmem occ logits and hidden state
                 occ_logits, hidden_cur = self.xmem.forward_step(
                     t_seq,
                     bev_xmem,
@@ -384,17 +392,17 @@ class TemporalPointPillar(PointPillar):
                     history_mode="full",
                 )
 
-
+                # get occ prob from logits
                 if occ_logits is not None and occ_logits.dim() == 3:
                     occ_logits = occ_logits.unsqueeze(1)
                 occ_prob = torch.sigmoid(occ_logits) if occ_logits is not None else None
 
+                # build GT occ target from GT boxes
                 gt_occ = self._build_gt_occ_target(batch_dict, H, W)
                 if self.training and gt_occ is not None:
                     target = gt_occ.detach().to(dtype=bev.dtype)
                 else:
                     target = scene_mask_gate.detach().to(dtype=bev.dtype)
-
 
                 # compute aux loss
                 if self.training and occ_logits is not None and target is not None:
@@ -426,14 +434,8 @@ class TemporalPointPillar(PointPillar):
                 bev_fused = bev + a * gate * temp
                 batch_dict["spatial_features_2d"] = bev_fused
 
-
-
+        # loss computation and post-processing
         if self.training:
-            loss_det = None
-            tb_dict = {}
-            disp_dict = {}
-
-            loss_det, tb_dict, disp_dict = self.get_training_loss()
 
             fwd_ret = self.dense_head.forward_ret_dict
             batch_cls_preds, batch_box_preds = self.dense_head.generate_predicted_boxes(
@@ -470,10 +472,26 @@ class TemporalPointPillar(PointPillar):
                 gt_occ=gt_occ,
             )
 
-            loss_total = loss_det if loss_det is not None else torch.zeros((), device=batch_dict["spatial_features_2d"].device)
+            if compute_det_loss is None or compute_aux_loss is None:
+                raise RuntimeError("forward() requires compute_det_loss and compute_aux_loss")
+            compute_det_loss = bool(compute_det_loss)
+            compute_aux_loss = bool(compute_aux_loss)
 
-            aux_occ_raw = aux_occ_loss
-            aux_cons_raw = aux_cons_loss
+            tb_dict = {}
+            disp_dict = {}
+
+            loss_det = None
+            if compute_det_loss:
+                loss_det, tb_dict, disp_dict = self.get_training_loss()
+
+            dev = batch_dict["spatial_features_2d"].device
+            loss_total = torch.zeros((), device=dev)
+
+            if loss_det is not None:
+                loss_total = loss_total + loss_det
+
+            aux_occ_raw = aux_occ_loss if compute_aux_loss else None
+            aux_cons_raw = aux_cons_loss if compute_aux_loss else None
 
             aux_occ_w = None
             aux_cons_w = None
@@ -485,8 +503,6 @@ class TemporalPointPillar(PointPillar):
             if aux_cons_raw is not None:
                 aux_cons_w = self.aux_cons_w * aux_cons_raw
                 loss_total = loss_total + aux_cons_w
-
-            dev = batch_dict["spatial_features_2d"].device
 
             tb_dict["loss_det"] = loss_det.detach() if loss_det is not None else torch.zeros((), device=dev)
             tb_dict["loss_aux_occ"] = aux_occ_raw.detach() if aux_occ_raw is not None else torch.zeros((), device=dev)
