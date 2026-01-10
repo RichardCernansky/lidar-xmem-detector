@@ -277,6 +277,17 @@ class TemporalPointPillar(PointPillar):
 
         return occ
 
+    def _bev_block_dropout(self, bev: torch.Tensor, drop_rate: float, block: int):
+        if drop_rate <= 0:
+            return bev
+        B, C, H, W = bev.shape
+        b = int(max(block, 1))
+        h2 = int((H + b - 1) // b)
+        w2 = int((W + b - 1) // b)
+        m_small = (torch.rand(B, 1, h2, w2, device=bev.device) > float(drop_rate)).to(dtype=bev.dtype)
+        m = F.interpolate(m_small, size=(H, W), mode="nearest")
+        return bev * m
+
 
     def detach_temporal_state(self):
         if isinstance(self.hidden_prev, torch.Tensor):
@@ -316,21 +327,19 @@ class TemporalPointPillar(PointPillar):
             batch_dict = cur_module(batch_dict)
 
             if cur_module is self.backbone_2d:
+                occ_logits = None
+                aux_occ = None
+                aux_cons = None
                 bev = batch_dict["spatial_features_2d"]
                 H, W = bev.shape[-2], bev.shape[-1]
 
                 det_prev_raw = det_instance_masks_prev
                 det_prev_warped = det_instance_masks_prev
+
+                #warp previous detection masks and hidden state
                 if t_seq > 0 and det_instance_masks_prev is not None and T_rel is not None:
                     det_prev_warped = self._transform_mask(det_instance_masks_prev, T_rel, H, W, mode="nearest")
                     det_instance_masks_prev = det_prev_warped
-
-
-                if det_instance_masks_prev is not None:
-                    scene_mask = (det_instance_masks_prev.sum(dim=1, keepdim=True) > 0).float()
-                else:
-                    scene_mask = self._build_scene_mask_from_bev(bev)
-
                 if t_seq > 0 and T_rel is not None and hasattr(self.xmem, "mms") and len(self.xmem.mms) > 0:
                     for mm in self.xmem.mms:
                         h = mm.get_hidden()
@@ -341,16 +350,40 @@ class TemporalPointPillar(PointPillar):
                         h2w = self._transform_feat(h2, T_rel_h, mode="bilinear")
                         h_warped = h2w.unsqueeze(1)
                         mm.set_hidden(h_warped if keep_state_grad else h_warped.detach())
+                
+                xmem_teacher = self.training and bool(batch_dict.get("_xmem_teacher"))
+                occ_corrupt = self.training and bool(batch_dict.get("_occ_corrupt"))
+                prev_thr = float(batch_dict.get("_xmem_prev_thr", 0.5))
+                # print("t_seq", t_seq, "xmem_teacher", xmem_teacher, "occ_corrupt", occ_corrupt, "prev_thr", prev_thr)
 
-                aux_occ = None
-                aux_cons = None
+                if det_instance_masks_prev is not None:
+                    scene_mask_gate = (det_instance_masks_prev.sum(dim=1, keepdim=True) > 0).to(dtype=bev.dtype)
+                else:
+                    scene_mask_gate = self._build_scene_mask_from_bev(bev).to(dtype=bev.dtype)
+
+                if xmem_teacher:
+                    scene_mask_xmem = scene_mask_gate
+                else:
+                    if (self.occ_prev is not None) and (T_rel is not None) and (t_seq > 0):
+                        prev_w = self._transform_mask(self.occ_prev, T_rel, H, W, mode="bilinear")
+                        scene_mask_xmem = (prev_w > prev_thr).to(dtype=bev.dtype)
+                    else:
+                        scene_mask_xmem = scene_mask_gate
+
+                bev_xmem = bev
+                if occ_corrupt:
+                    drop_rate = float(batch_dict.get("_occ_drop_rate", 0.5))
+                    block = int(batch_dict.get("_occ_block", 8))
+                    bev_xmem = self._bev_block_dropout(bev, drop_rate=drop_rate, block=block)
+
                 occ_logits, hidden_cur = self.xmem.forward_step(
                     t_seq,
-                    bev,
-                    scene_mask=scene_mask,
+                    bev_xmem,
+                    scene_mask=scene_mask_xmem,
                     keep_state_grad=keep_state_grad,
-                      history_mode="full",
+                    history_mode="full",
                 )
+
 
                 if occ_logits is not None and occ_logits.dim() == 3:
                     occ_logits = occ_logits.unsqueeze(1)
@@ -360,7 +393,7 @@ class TemporalPointPillar(PointPillar):
                 if self.training and gt_occ is not None:
                     target = gt_occ.detach().to(dtype=bev.dtype)
                 else:
-                    target = scene_mask.detach().to(dtype=bev.dtype)
+                    target = scene_mask_gate.detach().to(dtype=bev.dtype)
 
 
                 # compute aux loss
@@ -380,40 +413,19 @@ class TemporalPointPillar(PointPillar):
                 aux_occ_loss = aux_occ
                 aux_cons_loss = aux_cons            
 
+                # combine bev and temporal
                 a = float(alpha_temporal)
                 temp = self.hidden_to_bev(hidden_cur)
-
                 bev_scale = bev.detach().abs().mean(dim=1, keepdim=True)
                 temp_scale = temp.detach().abs().mean(dim=1, keepdim=True)
                 temp = temp * (bev_scale / (temp_scale + 1e-6))
 
-                if occ_prob is None:
-                    gate = scene_mask
-                else:
-                    # If gate is detached forever and occ_prob is trained only on pseudo-labels, it may become a smooth mask that doesn’t align with real objects well enough to help.
-
-                    # Fix later: once stable, allow some gradient through gate (or make gate depend on both occ and BEV), but only after it stops collapsing.
-                    # A) Gate collapse / shortcut
-
-                    # If gate is detached forever and occ_prob is trained only on pseudo-labels, it may become a smooth mask that doesn’t align with real objects well enough to help.
-
-                    # Fix later: once stable, allow some gradient through gate (or make gate depend on both occ and BEV), but only after it stops collapsing.
-
-                    # B) temp just mirrors BEV
-
-                    # If hidden_to_bev(hidden_cur) learns to reproduce BEV-like patterns, the branch is mostly redundant. It might still help as a mild denoiser, but not much.
-
-                    # How to detect: corr(temp_mag, bev_mag) is very high; delta_ratio stays high without improving det metrics.
-
-                    # C) Injection overwhelms baseline
-
-                    # If delta_ratio is consistently large (e.g. >0.5), you’re changing BEV too much; the detector becomes unstable.
-                    gate = 0.2 + 0.8 * occ_prob
-                    if self.training:
-                        gate = gate.detach()
-
+                gate = scene_mask_gate if occ_logits is None else (0.2 + 0.8 * torch.sigmoid(occ_logits))
+                if self.training:
+                    gate = gate.detach()
                 bev_fused = bev + a * gate * temp
                 batch_dict["spatial_features_2d"] = bev_fused
+
 
 
         if self.training:
@@ -452,7 +464,7 @@ class TemporalPointPillar(PointPillar):
                 occ_logits=occ_logits,
                 det_prev_raw=det_prev_raw,
                 det_prev_warped=det_prev_warped,
-                scene_mask=scene_mask,
+                scene_mask=scene_mask_gate,
                 det_next=det_masks_next,
                 frames_img=self.xmem.bev_adapter(bev),
                 gt_occ=gt_occ,

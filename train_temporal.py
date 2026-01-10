@@ -17,6 +17,14 @@ from pcdet.utils import common_utils
 from xmem_det.util import load_xmem_train_cfg
 
 
+def sample_flag(p: float) -> bool:
+    p = float(p)
+    if p <= 0.0:
+        return False
+    if p >= 1.0:
+        return True
+    return bool(torch.rand((), device="cpu").item() < p)
+
 
 def set_trainable_prefixes(model, prefixes):
     prefixes = tuple(prefixes)
@@ -157,6 +165,7 @@ def train_one_epoch(
         for t in range(burn):
             frame = frames[t]
             batch_dict = to_torch_batch_dict(frame, device)
+            batch_dict["_occ_corrupt"] = False
 
             if t == 0:
                 T_rel = None
@@ -183,6 +192,21 @@ def train_one_epoch(
         for t in range(burn, T - 1):
             frame = frames[t]
             batch_dict = to_torch_batch_dict(frame, device)
+            p_teacher = float(batch_dict.get("_p_teacher", 0.9))
+            p_corrupt = float(batch_dict.get("_p_corrupt", 0.2))
+
+            teacher_force = sample_flag(p_teacher)
+            corrupt = sample_flag(p_corrupt)
+
+            if t == 0:
+                teacher_force = True
+
+            batch_dict["_xmem_teacher"] = teacher_force
+            batch_dict["_occ_corrupt"] = corrupt
+
+            batch_dict["_occ_drop_rate"] = float(batch_dict.get("_occ_drop_rate", 0.5))
+            batch_dict["_occ_block"] = int(batch_dict.get("_occ_block", 8))
+            batch_dict["_xmem_prev_thr"] = float(batch_dict.get("_xmem_prev_thr", 0.5))
 
             if t == 0:
                 T_rel = None
@@ -202,9 +226,19 @@ def train_one_epoch(
             if isinstance(det_instance_masks_prev, torch.Tensor):
                 det_instance_masks_prev = det_instance_masks_prev.detach()
 
+      
         t_last = T - 1
         frame = frames[t_last]
         batch_dict = to_torch_batch_dict(frame, device)
+        
+        p_teacher_last = float(batch_dict.get("_p_teacher_last", 0.0))
+        p_corrupt_last = float(batch_dict.get("_p_corrupt_last", 1.0))
+        teacher_force = sample_flag(p_teacher_last)
+        corrupt = sample_flag(p_corrupt_last)
+        batch_dict["_xmem_teacher"] = teacher_force
+        batch_dict["_occ_corrupt"] = corrupt
+        batch_dict["_occ_drop_rate"] = 0.5
+        batch_dict["_occ_block"] = 8
 
         if t_last == 0:
             T_rel = None
