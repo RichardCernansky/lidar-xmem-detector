@@ -289,7 +289,7 @@ def train_one_epoch(
             T_rel=T_rel,
             alpha_temporal=float(alpha_temporal),
             keep_state_grad=True,
-            compute_det_loss=False,
+            compute_det_loss=True,
             compute_aux_loss=True,
         )
 
@@ -544,6 +544,7 @@ def main():
         model.load_state_dict(state, strict=False)
         logger.info(f"Loaded pretrained PP from {pretrained_pp_ckpt}")
 
+    # check required config keys
     cfg_req_int(phase_cfg, "START_EPOCH")
     cfg_req_int(phase_cfg, "END_EPOCH")
     cfg_req_float(phase_cfg, "LR_START")
