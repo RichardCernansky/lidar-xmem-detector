@@ -15,11 +15,6 @@ MAX_GRAD_NORM=10.0
 python train_temporal.py \
   --cfg_file "$CFG_FILE" \
   --xmem_cfg "$XMEM_CFG" \
-  --pretrained_pp_ckpt "$PP_BASELINE_CKPT" \
   --extra_tag "$EXTRA_TAG" \
   --workers "$WORKERS" \
-  --seq_len "$SEQ_LEN" \
-  --stride "$STRIDE" \
-  --max_grad_norm "$MAX_GRAD_NORM" \
-  --phase 1
 

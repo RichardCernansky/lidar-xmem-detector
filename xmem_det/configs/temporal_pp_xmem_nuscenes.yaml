@@ -1,4 +1,137 @@
-ADDONS: 
+ADDONS:
+  RUN:
+    PHASE: "1"
+    DEVICE: "cuda"
+
+    LOG_DIR: "log"
+    LOG_FILE_TEMPLATE: "train_temporal_pp_{tag}.txt"
+
+    VIS_DIR: "log/vis"
+    VIS_EVERY_SEQS: 10
+    VIS_TAG_TEMPLATE: "ep{epoch}_seq{seq:05d}"
+    VIS_B: 0
+
+    CKPT_DIR: "log/ckpt"
+
+    RESUME_CKPT: null
+    PRETRAINED_PP_CKPT: "/home/cernanskyr/OpenPCDet/output/cfgs/nuscenes_models/cbgs_pp_multihead/default/ckpt/checkpoint_epoch_20.pth"
+
+    USE_CKPT_EPOCH: true
+    RESUME_OPTIM_SCHED: true
+
+  DATALOADER:
+    BATCH_SIZE: 1
+    SHUFFLE: true
+    PIN_MEMORY: true
+    DROP_LAST: false
+
+  TRAIN_LOOP:
+    STATS_WINDOW: 200
+    TBPTT_K: 8
+    LOG_EVERY: 50
+    MAX_GRAD_NORM: 10.0
+
+    FORCE_TEACHER_ON_T0: true
+    BURN_IN_TEACHER_FORCE: false
+    BURN_IN_OCC_CORRUPT: false
+
+    OCC_DROP_RATE: 0.5
+    OCC_BLOCK: 8
+    XMEM_PREV_THR: 0.5
+
+  PHASES:
+    "1":
+      PREFIXES: ["xmem", "hidden_to_bev"]
+
+      START_EPOCH: 0
+      END_EPOCH: 8
+
+      LR_START: 2e-6
+      LR_MAX: 2e-4
+      LR_END: 2e-6
+      WARMUP_EPOCHS: 2
+
+      ALPHA_START: 0.0
+      ALPHA_END: 0.2
+      ALPHA_RAMP_EPOCHS: 8
+
+      PROB_SCHEDULE:
+        TEACHER:
+          START: 0.95
+          END: 0.10
+          RAMP_EPOCHS: 8
+        CORRUPT:
+          START: 0.05
+          END: 0.30
+          RAMP_EPOCHS: 8
+        TEACHER_LAST:
+          START: 0.0
+          END: 0.0
+          RAMP_EPOCHS: 1
+        CORRUPT_LAST:
+          START: 1.0
+          END: 1.0
+          RAMP_EPOCHS: 1
+
+      OPT_GROUP_SPECS:
+        - PREFIXES: ["xmem"]
+          LR_MULT: 0.6
+        - PREFIXES: ["hidden_to_bev"]
+          LR_MULT: 1.0
+        - PREFIXES: ["dense_head"]
+          LR_MULT: 0.0
+        - PREFIXES: ["backbone_2d"]
+          LR_MULT: 0.0
+
+      CKPT_NAME_TEMPLATE: "phase{phase}_{tag}_epoch_{epoch}.pth"
+
+    "2":
+      PREFIXES:
+        ["dense_head", "xmem", "motion_transform_net", "aux_head", "temporal_fusion", "state_gate", "state_cand"]
+
+      START_EPOCH: 8
+      END_EPOCH: 13
+
+      LR_START: 5e-6
+      LR_MAX: 2e-4
+      LR_END: 2e-6
+      WARMUP_EPOCHS: 1
+
+      ALPHA_START: 0.2
+      ALPHA_END: 0.6
+      ALPHA_RAMP_EPOCHS: 5
+
+      PROB_SCHEDULE:
+        TEACHER:
+          START: 0.10
+          END: 0.05
+          RAMP_EPOCHS: 5
+        CORRUPT:
+          START: 0.30
+          END: 0.40
+          RAMP_EPOCHS: 5
+        TEACHER_LAST:
+          START: 0.0
+          END: 0.0
+          RAMP_EPOCHS: 1
+        CORRUPT_LAST:
+          START: 1.0
+          END: 1.0
+          RAMP_EPOCHS: 1
+
+      OPT_GROUP_SPECS:
+        - PREFIXES: ["xmem"]
+          LR_MULT: 0.6
+        - PREFIXES: ["hidden_to_bev"]
+          LR_MULT: 1.0
+        - PREFIXES: ["dense_head"]
+          LR_MULT: 1.0
+        - PREFIXES: ["backbone_2d"]
+          LR_MULT: 0.0
+
+      CKPT_NAME_TEMPLATE: "phase{phase}_{tag}_epoch_{epoch}.pth"
+
+
 
 
 CLASS_NAMES: ['car','truck', 'construction_vehicle', 'bus', 'trailer',

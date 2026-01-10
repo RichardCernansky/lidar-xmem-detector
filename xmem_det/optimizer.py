@@ -3,6 +3,8 @@ import torch
 import math
 from torch.optim.lr_scheduler import LambdaLR
 
+from config_utils import cfg_req_nn, cfg_req_float, cfg_req_int, _require_pos_int, _require_prob_01
+from typing import Any, Dict, List, Tuple
 
 def set_trainable_prefixes(model, prefixes):
     prefixes = tuple(prefixes)
@@ -132,3 +134,59 @@ def build_warmup_cosine_factor_scheduler(optimizer, steps_per_epoch, epochs, lr_
         return end_factor + (1.0 - end_factor) * c
 
     return LambdaLR(optimizer, lr_lambda=[factor for _ in optimizer.param_groups])
+
+def linear_ramp(epoch_idx: int, start_epoch: int, start: float, end: float, ramp_epochs: int) -> float:
+    r = int(ramp_epochs)
+    _require_pos_int("RAMP_EPOCHS", r)
+    x = float(epoch_idx + 1 - int(start_epoch)) / float(r)
+    if x < 0.0:
+        x = 0.0
+    if x > 1.0:
+        x = 1.0
+    return float(start) + (float(end) - float(start)) * x
+
+
+
+def _prob_sched_epoch(phase_cfg: Any, epoch: int, start_epoch: int) -> Dict[str, float]:
+    ps = cfg_req_nn(phase_cfg, "PROB_SCHEDULE")
+
+    t = cfg_req_nn(ps, "TEACHER")
+    c = cfg_req_nn(ps, "CORRUPT")
+    tl = cfg_req_nn(ps, "TEACHER_LAST")
+    cl = cfg_req_nn(ps, "CORRUPT_LAST")
+
+    p_teacher = linear_ramp(
+        epoch_idx=epoch,
+        start_epoch=start_epoch,
+        start=_require_prob_01("TEACHER.START", cfg_req_float(t, "START")),
+        end=_require_prob_01("TEACHER.END", cfg_req_float(t, "END")),
+        ramp_epochs=cfg_req_int(t, "RAMP_EPOCHS"),
+    )
+    p_corrupt = linear_ramp(
+        epoch_idx=epoch,
+        start_epoch=start_epoch,
+        start=_require_prob_01("CORRUPT.START", cfg_req_float(c, "START")),
+        end=_require_prob_01("CORRUPT.END", cfg_req_float(c, "END")),
+        ramp_epochs=cfg_req_int(c, "RAMP_EPOCHS"),
+    )
+    p_teacher_last = linear_ramp(
+        epoch_idx=epoch,
+        start_epoch=start_epoch,
+        start=_require_prob_01("TEACHER_LAST.START", cfg_req_float(tl, "START")),
+        end=_require_prob_01("TEACHER_LAST.END", cfg_req_float(tl, "END")),
+        ramp_epochs=cfg_req_int(tl, "RAMP_EPOCHS"),
+    )
+    p_corrupt_last = linear_ramp(
+        epoch_idx=epoch,
+        start_epoch=start_epoch,
+        start=_require_prob_01("CORRUPT_LAST.START", cfg_req_float(cl, "START")),
+        end=_require_prob_01("CORRUPT_LAST.END", cfg_req_float(cl, "END")),
+        ramp_epochs=cfg_req_int(cl, "RAMP_EPOCHS"),
+    )
+
+    return {
+        "p_teacher": float(p_teacher),
+        "p_corrupt": float(p_corrupt),
+        "p_teacher_last": float(p_teacher_last),
+        "p_corrupt_last": float(p_corrupt_last),
+    }
