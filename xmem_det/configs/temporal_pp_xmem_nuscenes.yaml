@@ -1,21 +1,23 @@
 ADDONS:
   RUN:
-    PHASE: "1"
+    PHASE: "0"
     DEVICE: "cuda"
 
     LOG_DIR: "log"
     LOG_FILE_TEMPLATE: "train_temporal_pp_{tag}.txt"
 
     VIS_DIR: "log/vis"
-    VIS_EVERY_SEQS: 100
+    VIS_EVERY_SEQS: 50
     VIS_TAG_TEMPLATE: "ep{epoch}_seq{seq:05d}"
     VIS_B: 0
 
     CKPT_DIR: "log/ckpt"
 
-    RESUME_CKPT: "/home/cernanskyr/pp_xmem_det/log/ckpt/phase0_phase1_epoch_8.pth"
+    # either one of RESUME_CKPT and PRETRAINED_PP_CKPT can be set to non-null
+    # RESUME_CKPT: "/home/cernanskyr/pp_xmem_det/log/ckpt/phase0_phase1_epoch_8.pth"
+    RESUME_CKPT: null
     PRETRAINED_PP_CKPT: null
-    # PRETRAINED_PP_CKPT: "/home/cernanskyr/OpenPCDet/output/cfgs/nuscenes_models/cbgs_pp_multihead/default/ckpt/checkpoint_epoch_20.pth"
+    PRETRAINED_PP_CKPT: "/home/cernanskyr/OpenPCDet/output/cfgs/nuscenes_models/cbgs_pp_multihead/default/ckpt/checkpoint_epoch_20.pth"
 
     USE_CKPT_EPOCH: true
     RESUME_OPTIM_SCHED: false
@@ -386,7 +388,7 @@ OPTIMIZATION:
   MOMENTUM: 0.9
 
 TRAIN:
-  SEQ_LEN: 3 
+  SEQ_LEN: 3  
   STRIDE: 4
   VAL_EVAL_INTERVAL: 1
   LOG_INTERVAL: 50

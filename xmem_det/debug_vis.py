@@ -1,10 +1,9 @@
 import os
-from typing import Optional, List, Tuple, Union
+from typing import Optional, List, Union
 
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-
 
 ArrayLike = Union[np.ndarray, None]
 
@@ -18,20 +17,11 @@ def _agg2d(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         return x.abs().mean(dim=1, keepdim=False)
     if x.dim() == 2:
         return x
-    return x.view(-1)
+    return x.reshape(-1)
 
 
 def _to_numpy_2d(x: torch.Tensor) -> np.ndarray:
     return x.detach().float().cpu().numpy()
-
-
-def _to_numpy_rgb(x: torch.Tensor) -> np.ndarray:
-    y = x.detach().float().cpu().numpy()
-    y = np.transpose(y, (1, 2, 0))
-    out = np.zeros_like(y, dtype=np.float32)
-    for c in range(3):
-        out[..., c] = _norm01(y[..., c])
-    return out
 
 
 def _norm01(x: np.ndarray) -> np.ndarray:
@@ -43,7 +33,16 @@ def _norm01(x: np.ndarray) -> np.ndarray:
     return np.clip(y, 0.0, 1.0)
 
 
-def _as_image(p: np.ndarray) -> np.ndarray:
+def _to_numpy_rgb(x: torch.Tensor) -> np.ndarray:
+    y = x.detach().float().cpu().numpy()
+    y = np.transpose(y, (1, 2, 0))
+    out = np.zeros_like(y, dtype=np.float32)
+    for c in range(3):
+        out[..., c] = _norm01(y[..., c])
+    return out
+
+
+def _as_image(p: np.ndarray) -> Optional[np.ndarray]:
     p = np.asarray(p)
     if p.ndim == 0:
         return None
@@ -94,9 +93,6 @@ def dump_temporal_debug(
     temp: torch.Tensor,
     hidden_cur: torch.Tensor,
     occ_logits: Optional[torch.Tensor],
-    det_prev_raw: Optional[torch.Tensor],
-    det_prev_warped: Optional[torch.Tensor],
-    scene_mask: Optional[torch.Tensor],
     det_next: Optional[torch.Tensor],
     frames_img: Optional[torch.Tensor],
     gt_occ: Optional[torch.Tensor] = None,
@@ -116,28 +112,12 @@ def dump_temporal_debug(
     if b >= B:
         b = B - 1
 
-    bev_mag = _agg2d(bev[b:b+1])[0]
-    bevf_mag = _agg2d(bev_fused[b:b+1])[0]
-    temp_mag = _agg2d(temp[b:b+1])[0]
-    hid_mag = _agg2d(hidden_cur[b:b+1])[0]
+    bev_mag = _agg2d(bev[b:b + 1])[0]
+    bevf_mag = _agg2d(bev_fused[b:b + 1])[0]
+    temp_mag = _agg2d(temp[b:b + 1])[0]
+    hid_mag = _agg2d(hidden_cur[b:b + 1])[0]
     hid_std = hidden_cur[b].detach().float().std(dim=0)
-    delta_mag = (bev_fused[b:b+1] - bev[b:b+1]).abs().mean(dim=1)[0]
-
-    m_prev_raw = None
-    if det_prev_raw is not None:
-        m_prev_raw = det_prev_raw[b:b+1].max(dim=1)[0][0]
-
-    m_prev_warp = None
-    if det_prev_warped is not None:
-        m_prev_warp = det_prev_warped[b:b+1].max(dim=1)[0][0]
-
-    m_next = None
-    if det_next is not None:
-        m_next = det_next[b:b+1].max(dim=1)[0][0]
-
-    sm = None
-    if scene_mask is not None:
-        sm = scene_mask[b, 0]
+    delta_mag = (bev_fused[b:b + 1] - bev[b:b + 1]).abs().mean(dim=1)[0]
 
     occ_prob = None
     if occ_logits is not None:
@@ -154,6 +134,13 @@ def dump_temporal_debug(
     if occ_prob is not None and gt is not None:
         occ_err = (occ_prob - gt).abs()
 
+    m_next = None
+    if det_next is not None:
+        if det_next.dim() == 4:
+            m_next = det_next[b:b + 1].max(dim=1)[0][0]
+        elif det_next.dim() == 3:
+            m_next = det_next[b]
+
     rgb = None
     if frames_img is not None and frames_img.dim() == 4 and frames_img.shape[1] == 3:
         rgb = _to_numpy_rgb(frames_img[b])
@@ -168,10 +155,7 @@ def dump_temporal_debug(
         None if occ_prob is None else _norm01(_to_numpy_2d(occ_prob)),
         None if gt is None else _norm01(_to_numpy_2d(gt)),
         None if occ_err is None else _norm01(_to_numpy_2d(occ_err)),
-        None if m_prev_raw is None else _norm01(_to_numpy_2d(m_prev_raw)),
-        None if m_prev_warp is None else _norm01(_to_numpy_2d(m_prev_warp)),
         None if m_next is None else _norm01(_to_numpy_2d(m_next)),
-        None if sm is None else _norm01(_to_numpy_2d(sm)),
         rgb,
     ]
 
@@ -185,13 +169,9 @@ def dump_temporal_debug(
         "occ_prob",
         "gt_occ",
         "occ_abs_err",
-        "det_prev_raw",
-        "det_prev_warped",
         "det_next",
-        "scene_mask",
         "bev_adapter_rgb",
     ]
 
     out_path = os.path.join(vis_dir, f"{vis_tag}_t{int(t_seq):03d}.png")
     _save_grid(out_path, panels, titles, ncols=3)
-

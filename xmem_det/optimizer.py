@@ -64,14 +64,13 @@ def build_warmup_cosine_scheduler(optimizer, steps_per_epoch, epochs, lr_start=1
     )
 
 
-import torch
-
 def build_optimizer_with_prefix_multipliers(model, cfg, base_lr, group_specs):
     named = list(model.named_parameters())
-    selected = []
     seen = set()
-
     groups = []
+
+    weight_decay = float(cfg.OPTIMIZATION.WEIGHT_DECAY)
+
     for prefixes, mult in group_specs:
         params = []
         for n, p in named:
@@ -85,7 +84,13 @@ def build_optimizer_with_prefix_multipliers(model, cfg, base_lr, group_specs):
             seen.add(pid)
             params.append(p)
         if params:
-            groups.append({"params": params, "lr": float(base_lr) * float(mult)})
+            groups.append(
+                {
+                    "params": params,
+                    "lr": float(base_lr) * float(mult),
+                    "weight_decay": weight_decay,
+                }
+            )
 
     leftovers = []
     for n, p in named:
@@ -98,14 +103,20 @@ def build_optimizer_with_prefix_multipliers(model, cfg, base_lr, group_specs):
         leftovers.append(p)
 
     if leftovers:
-        groups.append({"params": leftovers, "lr": float(base_lr)})
+        groups.append(
+            {
+                "params": leftovers,
+                "lr": float(base_lr),
+                "weight_decay": weight_decay,
+            }
+        )
 
-    return torch.optim.SGD(
-        groups,
-        lr=float(base_lr),
-        momentum=float(cfg.OPTIMIZATION.MOMENTUM),
-        weight_decay=float(cfg.OPTIMIZATION.WEIGHT_DECAY),
-    )
+    if len(groups) == 0:
+        raise ValueError("No trainable parameters matched prefixes; optimizer got an empty parameter list")
+
+    return torch.optim.AdamW(groups, lr=float(base_lr), weight_decay=weight_decay)
+
+
 
 
 def build_warmup_cosine_factor_scheduler(optimizer, steps_per_epoch, epochs, lr_start, lr_max, lr_end, warmup_epochs=1):

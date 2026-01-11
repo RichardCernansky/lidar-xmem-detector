@@ -9,3 +9,4 @@ deep_update_every: -1
 top_k: 30
 benchmark: false
 single_object: false
+hidden_dim: 64
