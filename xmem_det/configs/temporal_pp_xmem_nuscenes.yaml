@@ -1,6 +1,6 @@
 ADDONS:
   RUN:
-    PHASE: "0"
+    PHASE: "1"
     DEVICE: "cuda"
 
     LOG_DIR: "log"
@@ -14,9 +14,9 @@ ADDONS:
     CKPT_DIR: "log/ckpt"
 
     # either one of RESUME_CKPT and PRETRAINED_PP_CKPT can be set to non-null
-    # RESUME_CKPT: "/home/cernanskyr/pp_xmem_det/log/ckpt/phase0_phase1_epoch_8.pth"
+    # RESUME_CKPT: "/home/cernanskyr/pp_xmem_det/log/ckpt/phase1_phase1_epoch_16.pth"
     RESUME_CKPT: null
-    PRETRAINED_PP_CKPT: null
+    # PRETRAINED_PP_CKPT: null
     PRETRAINED_PP_CKPT: "/home/cernanskyr/OpenPCDet/output/cfgs/nuscenes_models/cbgs_pp_multihead/default/ckpt/checkpoint_epoch_20.pth"
 
     USE_CKPT_EPOCH: true
@@ -49,10 +49,10 @@ ADDONS:
       START_EPOCH: 0
       END_EPOCH: 8
 
-      LR_START: 2e-6
-      LR_MAX: 2e-4
-      LR_END: 2e-6
-      WARMUP_EPOCHS: 2
+      LR_START: 2e-5
+      LR_MAX: 3e-5
+      LR_END: 1e-6
+      WARMUP_EPOCHS: 0
 
       ALPHA_START: 0.0
       ALPHA_END: 0.0
@@ -89,28 +89,28 @@ ADDONS:
       CKPT_NAME_TEMPLATE: "phase{phase}_{tag}_epoch_{epoch}.pth"
 
     "1":
-      PREFIXES: ["xmem", "hidden_to_bev"]
+      PREFIXES: ["xmem"]
 
-      START_EPOCH: 8 
-      END_EPOCH: 13
+      START_EPOCH: 0 
+      END_EPOCH: 10
 
-      LR_START: 1e-6
-      LR_MAX: 1e-4
-      LR_END: 5e-6
-      WARMUP_EPOCHS: 1
+      LR_START: 1.5e-5
+      LR_MAX: 1.5e-5
+      LR_END: 5e-7
+      WARMUP_EPOCHS: 0
 
       ALPHA_START: 0.0
-      ALPHA_END: 0.2
+      ALPHA_END: 0.0
       ALPHA_RAMP_EPOCHS: 5
 
       PROB_SCHEDULE:
         TEACHER:
-          START: 0.5
-          END: 0.10
+          START: 0.0
+          END: 0.0
           RAMP_EPOCHS: 5
         CORRUPT:
-          START: 0.10
-          END: 0.30
+          START: 0.0
+          END: 0.0
           RAMP_EPOCHS: 5
 
         TEACHER_LAST:
@@ -118,15 +118,15 @@ ADDONS:
           END: 0.0
           RAMP_EPOCHS: 5
         CORRUPT_LAST:
-          START: 0.3
-          END: 0.6
+          START: 0.0
+          END: 0.0
           RAMP_EPOCHS: 5
 
       OPT_GROUP_SPECS:
         - PREFIXES: ["xmem"]
           LR_MULT: 1.0
         - PREFIXES: ["hidden_to_bev"]
-          LR_MULT: 1.0
+          LR_MULT: 0.0
         - PREFIXES: ["dense_head"]
           LR_MULT: 0.0
         - PREFIXES: ["backbone_2d"]
@@ -388,7 +388,7 @@ OPTIMIZATION:
   MOMENTUM: 0.9
 
 TRAIN:
-  SEQ_LEN: 3  
+  SEQ_LEN: 8  
   STRIDE: 4
   VAL_EVAL_INTERVAL: 1
   LOG_INTERVAL: 50

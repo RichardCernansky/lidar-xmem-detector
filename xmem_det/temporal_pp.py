@@ -204,7 +204,6 @@ class TemporalPointPillar(PointPillar):
                     aux_occ_loss = aux_occ_loss + loss_ti
 
 
-            
             # Average over frames
             aux_occ_loss = aux_occ_loss / (T - 1)
         
