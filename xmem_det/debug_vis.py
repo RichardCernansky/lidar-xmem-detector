@@ -175,3 +175,101 @@ def dump_temporal_debug(
 
     out_path = os.path.join(vis_dir, f"{vis_tag}_t{int(t_seq):03d}.png")
     _save_grid(out_path, panels, titles, ncols=3)
+
+
+
+from pathlib import Path
+
+import numpy as np
+import torch
+
+
+def _norm_u8_rgb(chw):
+    x = chw.astype(np.float32)
+    x = np.transpose(x, (1, 2, 0))
+    mn = float(x.min())
+    mx = float(x.max())
+    if mx - mn < 1e-8:
+        y = np.zeros_like(x, dtype=np.float32)
+    else:
+        y = (x - mn) / (mx - mn)
+    y = np.clip(y, 0.0, 1.0)
+    return (y * 255.0).astype(np.uint8)
+
+
+def _to_np(x):
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def dump_xmem_sequence_vis(
+    out_dir,
+    scene_token,
+    seq_idx,
+    frames_rgb_bt3hw,
+    occ_prob_bt1hw,
+    gt_occ_bt1hw,
+    thr=0.5,
+    ious=None,
+    max_cols=16,
+    dpi=140,
+):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    frames = _to_np(frames_rgb_bt3hw)
+    occ = _to_np(occ_prob_bt1hw)
+    gt = _to_np(gt_occ_bt1hw)
+
+    if frames.ndim != 5:
+        raise ValueError(f"frames_rgb_bt3hw must be [B,T,3,H,W], got {frames.shape}")
+    if occ.ndim != 5:
+        raise ValueError(f"occ_prob_bt1hw must be [B,T,1,H,W], got {occ.shape}")
+    if gt.ndim != 5:
+        raise ValueError(f"gt_occ_bt1hw must be [B,T,1,H,W], got {gt.shape}")
+
+    B, T, _, H, W = frames.shape
+    b = 0
+
+    t_show = min(int(T), int(max_cols))
+    frames_b = frames[b, :t_show]
+    occ_b = occ[b, :t_show, 0]
+    gt_b = gt[b, :t_show, 0]
+
+    pred_b = occ_b > float(thr)
+
+    fig_w = max(4.0, 2.2 * t_show)
+    fig_h = 6.6
+    fig, axes = plt.subplots(3, t_show, figsize=(fig_w, fig_h), squeeze=False)
+
+    for ti in range(t_show):
+        axes[0, ti].imshow(_norm_u8_rgb(frames_b[ti]))
+        axes[0, ti].set_axis_off()
+        title0 = f"t={ti}"
+        if ious is not None and ti < len(ious):
+            v = ious[ti]
+            if v is not None and np.isfinite(v):
+                title0 = title0 + f"  IoU={float(v):.3f}"
+        axes[0, ti].set_title(title0, fontsize=9)
+
+        axes[1, ti].imshow(pred_b[ti].astype(np.uint8), vmin=0, vmax=1, interpolation="nearest")
+        axes[1, ti].set_axis_off()
+        axes[1, ti].set_title("pred", fontsize=9)
+
+        axes[2, ti].imshow((gt_b[ti] > 0.5).astype(np.uint8), vmin=0, vmax=1, interpolation="nearest")
+        axes[2, ti].set_axis_off()
+        axes[2, ti].set_title("gt", fontsize=9)
+
+    fig.suptitle(f"scene={scene_token}  seq={int(seq_idx)}  thr={float(thr):.2f}", fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+
+    out_path = out_dir / f"xmem_seq_{int(seq_idx):06d}.png"
+    fig.savefig(out_path, dpi=int(dpi))
+    plt.close(fig)
+
+    return str(out_path)

@@ -152,6 +152,7 @@ def train_one_epoch(
 
     stats = TrainStats(w=int(stats_window))
 
+    det_mask_prev = None
     for seq_idx, seq in enumerate(train_loader):
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats()
@@ -188,12 +189,16 @@ def train_one_epoch(
 
         
         # === FORWARD PASS ALL FRAMES AT ONCE ===
+        use_det_t0 = not sample_flag(probs.get("p_teacher"))
+        # print("use_det_t0:", use_det_t0)
         ret_dict, tb_dict, disp_dict, det_masks = model(
             frames_list=frames_list,
             alpha_temporal=float(alpha_temporal),
             compute_det_loss=True,
             compute_aux_loss=True,
+            use_det_t0=use_det_t0,
         )
+
 
         loss = ret_dict["loss"]
         
@@ -335,8 +340,8 @@ def train_phase(
         logger.info(
             f"Epoch {epoch + 1}/{end_epoch} "
             f"alpha={alpha:.3f} lr={lr:.3e} "
-            f"pT={probs['p_teacher']:.3f} pC={probs['p_corrupt']:.3f} "
-            f"pT_last={probs['p_teacher_last']:.3f} pC_last={probs['p_corrupt_last']:.3f}"
+            f"pT={probs['p_teacher']:.3f} "
+            # f"pT_last={probs['p_teacher_last']:.3f} pC_last={probs['p_corrupt_last']:.3f}"
         )
 
         train_one_epoch(
@@ -439,13 +444,21 @@ def main():
     resume_blob = None
     if resume_ckpt is not None:
         resume_blob = torch.load(str(resume_ckpt), map_location="cpu")
-        model.load_state_dict(resume_blob["model_state"], strict=True)
+        model.load_state_dict(resume_blob["model_state"], strict=False)
         logger.info(f"Resumed model from {resume_ckpt} at epoch {int(resume_blob.get('epoch', 0))}")
     elif pretrained_pp_ckpt is not None:
         ckpt = torch.load(str(pretrained_pp_ckpt), map_location="cpu")
         state = ckpt["model_state"] if "model_state" in ckpt else ckpt
         model.load_state_dict(state, strict=False)
         logger.info(f"Loaded pretrained PP from {pretrained_pp_ckpt}")
+    # ckpt_path = "log/ckpt/phase1_only_seq8_epoch_9.pth"
+    # ckpt = torch.load(ckpt_path, map_location="cpu")
+    # state = ckpt.get("model_state", ckpt)
+    # print(state.keys())
+    # prefix = "xmem."
+    # xmem_state = {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
+    # model.xmem.load_state_dict(xmem_state, strict=True)
+
 
     # check required config keys
     cfg_req_int(phase_cfg, "START_EPOCH")
@@ -462,7 +475,6 @@ def main():
     cfg_req_nn(phase_cfg, "OPT_GROUP_SPECS")
 
     cfg_req_int(loop_cfg, "STATS_WINDOW")
-    cfg_req_int(loop_cfg, "TBPTT_K")
     cfg_req_int(loop_cfg, "LOG_EVERY")
     cfg_req_float(loop_cfg, "MAX_GRAD_NORM")
     cfg_req_bool(loop_cfg, "FORCE_TEACHER_ON_T0")

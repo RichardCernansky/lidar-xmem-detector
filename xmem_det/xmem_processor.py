@@ -82,14 +82,15 @@ class XMemProcessor:
         f4 = f4_bt.view(b, T, C4, h4, w4).contiguous()
 
         filler_one = torch.zeros(1, dtype=torch.int64, device=frames.device)
-        hidden = torch.zeros((b, num_objects, self.config['hidden_dim'], hk, wk),
-                            device=frames.device, dtype=frames.dtype)
+        hidden = torch.zeros((b, num_objects, self.config['hidden_dim'], hk, wk), device=frames.device, dtype=frames.dtype)
 
         v16, hidden = self.XMem('encode_value', frames_bthw[:, 0], f16[:, 0], hidden, first_frame_gt)
         values = v16.unsqueeze(3)
 
         out['masks_0'] = first_frame_gt
         out['logits_0'] = None
+
+        readouts = []
 
         for ti in range(1, T):
             if ti <= self.num_ref_frames:
@@ -103,9 +104,7 @@ class XMemProcessor:
                 ]
                 ref_values = torch.stack([values[bi, :, :, indices[bi]] for bi in range(b)], 0)
                 ref_keys = torch.stack([key[bi, :, indices[bi]] for bi in range(b)], 0)
-                ref_shrinkage = torch.stack(
-                    [shrinkage[bi, :, indices[bi]] for bi in range(b)], 0
-                ) if shrinkage is not None else None
+                ref_shrinkage = torch.stack([shrinkage[bi, :, indices[bi]] for bi in range(b)], 0) if shrinkage is not None else None
 
             memory_readout = self.XMem(
                 'read_memory',
@@ -115,6 +114,8 @@ class XMemProcessor:
                 ref_shrinkage,
                 ref_values
             )
+
+            readouts.append(memory_readout[:, 0])
 
             hidden, logits, masks = self.XMem(
                 'segment',
@@ -140,4 +141,9 @@ class XMemProcessor:
             out[f'masks_{ti}'] = masks
             out[f'logits_{ti}'] = logits
 
-        return out, hidden
+        if len(readouts) > 0:
+            readouts = torch.stack(readouts, dim=1)
+        else:
+            readouts = torch.zeros((b, 0, 512, hk, wk), device=frames.device, dtype=frames.dtype)
+
+        return out, readouts, hidden

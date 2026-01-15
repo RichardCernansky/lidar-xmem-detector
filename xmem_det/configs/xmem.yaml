@@ -7,5 +7,5 @@ enable_long_term: true
 enable_long_term_count_usage: true
 top_k: 30
 benchmark: false
-single_object: false
+single_object: true 
 hidden_dim: 64

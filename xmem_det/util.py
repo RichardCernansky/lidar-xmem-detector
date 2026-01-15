@@ -57,4 +57,5 @@ def boxes_to_bev_masks(
                 continue
             masks[b, n, y0:y1, x0:x1] = 1.0
 
+    
     return masks

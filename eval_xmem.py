@@ -15,6 +15,12 @@ from pcdet.utils import common_utils
 
 from xmem_det.temporal_pp import TemporalPointPillar
 from xmem_det.util import load_xmem_train_cfg
+from xmem_det.debug_vis import dump_xmem_sequence_vis
+
+
+VIS_MAX_SEQS = 50
+VIS_MAX_COLS = 16
+VIS_DPI = 140
 
 
 def to_torch_batch_dict(frame_dict, device):
@@ -105,6 +111,9 @@ def main():
     eval_output_dir = output_dir / "eval_xmem" / args.eval_tag
     eval_output_dir.mkdir(parents=True, exist_ok=True)
 
+    vis_output_dir = eval_output_dir / "vis"
+    vis_output_dir.mkdir(parents=True, exist_ok=True)
+
     log_file = eval_output_dir / ("log_eval_%s.txt" % datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
     logger = common_utils.create_logger(log_file, rank=0)
 
@@ -115,6 +124,7 @@ def main():
     logger.info(f"split={cfg.DATA_CONFIG.DATA_SPLIT['test']}")
     logger.info(f"seq_len={args.seq_len} stride={args.stride} keep_last_partial={bool(args.keep_last_partial)}")
     logger.info(f"thr={args.thr} include_first={bool(args.include_first)}")
+    logger.info(f"VIS_MAX_SEQS={VIS_MAX_SEQS} VIS_MAX_COLS={VIS_MAX_COLS} VIS_DPI={VIS_DPI}")
     log_config_to_file(cfg, logger=logger)
 
     test_set, _, _ = build_dataloader(
@@ -171,6 +181,7 @@ def main():
 
     total_seqs = 0
     start_t = time.time()
+    vis_saved = 0
 
     with torch.no_grad():
         seq_id = 0
@@ -231,10 +242,14 @@ def main():
                 frames_rgb = torch.cat(frames_rgb_list, dim=0)
                 first_frame_gt = gt_list[0]
 
-                xmem_out, _ = model.xmem_processor.do_pass(frames=frames_rgb, first_frame_gt=first_frame_gt, T=len(window))
+                xmem_out, _ = model.xmem_processor.do_pass(
+                    frames=frames_rgb,
+                    first_frame_gt=first_frame_gt,
+                    T=len(window)
+                )
 
-                seq_ious = []
                 start_ti = 0 if args.include_first else 1
+                iou_list_full = [None] * len(window)
 
                 for ti in range(start_ti, len(window)):
                     key = f"masks_{ti}"
@@ -248,7 +263,8 @@ def main():
                     iou_b = iou_binary(pred, gt)
                     iou = float(iou_b.mean().item())
 
-                    seq_ious.append(iou)
+                    iou_list_full[ti] = iou
+
                     sum_iou_frames += iou
                     cnt_iou_frames += 1
 
@@ -260,9 +276,46 @@ def main():
                         sum_iou_last += iou
                         cnt_iou_last += 1
 
+                seq_ious = [v for v in iou_list_full[start_ti:] if v is not None]
                 if len(seq_ious) > 0:
                     sum_iou_seq_mean += float(sum(seq_ious) / len(seq_ious))
                     cnt_iou_seqs += 1
+
+                if vis_saved < VIS_MAX_SEQS:
+                    Bt, _, Hx, Wx = frames_rgb.shape
+                    T0 = len(window)
+                    B0 = int(Bt // T0)
+                    frames_bt3hw = frames_rgb.detach().cpu().reshape(B0, T0, 3, Hx, Wx)
+
+                    occ_bt1hw = torch.zeros((B0, T0, 1, Hx, Wx), dtype=torch.float32)
+                    gt_bt1hw = torch.zeros((B0, T0, 1, Hx, Wx), dtype=torch.float32)
+
+                    for ti in range(T0):
+                        key = f"masks_{ti}"
+                        if key in xmem_out:
+                            occ_prob = occ_prob_from_xmem_masks(xmem_out[key]).detach().cpu().to(torch.float32)
+                            occ_bt1hw[:, ti] = occ_prob
+                        gt_bt1hw[:, ti] = gt_list[ti].detach().cpu().to(torch.float32)
+
+                    ious_for_vis = []
+                    for ti in range(T0):
+                        v = iou_list_full[ti]
+                        ious_for_vis.append(float(v) if v is not None else float("nan"))
+
+                    out_path = dump_xmem_sequence_vis(
+                        out_dir=vis_output_dir / scene_token,
+                        scene_token=scene_token,
+                        seq_idx=seq_id,
+                        frames_rgb_bt3hw=frames_bt3hw,
+                        occ_prob_bt1hw=occ_bt1hw,
+                        gt_occ_bt1hw=gt_bt1hw,
+                        thr=float(args.thr),
+                        ious=ious_for_vis,
+                        max_cols=int(VIS_MAX_COLS),
+                        dpi=int(VIS_DPI),
+                    )
+                    # logger.info(f"vis_saved={vis_saved+1}/{VIS_MAX_SEQS} path={out_path}")
+                    vis_saved += 1
 
                 total_seqs += 1
                 seq_id += 1
@@ -300,6 +353,10 @@ def main():
         "mIoU_seq": float(miou_seq),
         "mIoU_3rd_frame": float(miou_t3),
         "mIoU_last_frame": float(miou_last),
+        "vis_saved": int(vis_saved),
+        "VIS_MAX_SEQS": int(VIS_MAX_SEQS),
+        "VIS_MAX_COLS": int(VIS_MAX_COLS),
+        "VIS_DPI": int(VIS_DPI),
     }
 
     out_json = Path(eval_output_dir) / "xmem_miou.json"

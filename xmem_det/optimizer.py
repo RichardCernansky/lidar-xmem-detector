@@ -162,9 +162,9 @@ def _prob_sched_epoch(phase_cfg: Any, epoch: int, start_epoch: int) -> Dict[str,
     ps = cfg_req_nn(phase_cfg, "PROB_SCHEDULE")
 
     t = cfg_req_nn(ps, "TEACHER")
-    c = cfg_req_nn(ps, "CORRUPT")
-    tl = cfg_req_nn(ps, "TEACHER_LAST")
-    cl = cfg_req_nn(ps, "CORRUPT_LAST")
+    # c = cfg_req_nn(ps, "CORRUPT")
+    # tl = cfg_req_nn(ps, "TEACHER_LAST")
+    # cl = cfg_req_nn(ps, "CORRUPT_LAST")
 
     p_teacher = linear_ramp(
         epoch_idx=epoch,
@@ -173,31 +173,31 @@ def _prob_sched_epoch(phase_cfg: Any, epoch: int, start_epoch: int) -> Dict[str,
         end=_require_prob_01("TEACHER.END", cfg_req_float(t, "END")),
         ramp_epochs=cfg_req_int(t, "RAMP_EPOCHS"),
     )
-    p_corrupt = linear_ramp(
-        epoch_idx=epoch,
-        start_epoch=start_epoch,
-        start=_require_prob_01("CORRUPT.START", cfg_req_float(c, "START")),
-        end=_require_prob_01("CORRUPT.END", cfg_req_float(c, "END")),
-        ramp_epochs=cfg_req_int(c, "RAMP_EPOCHS"),
-    )
-    p_teacher_last = linear_ramp(
-        epoch_idx=epoch,
-        start_epoch=start_epoch,
-        start=_require_prob_01("TEACHER_LAST.START", cfg_req_float(tl, "START")),
-        end=_require_prob_01("TEACHER_LAST.END", cfg_req_float(tl, "END")),
-        ramp_epochs=cfg_req_int(tl, "RAMP_EPOCHS"),
-    )
-    p_corrupt_last = linear_ramp(
-        epoch_idx=epoch,
-        start_epoch=start_epoch,
-        start=_require_prob_01("CORRUPT_LAST.START", cfg_req_float(cl, "START")),
-        end=_require_prob_01("CORRUPT_LAST.END", cfg_req_float(cl, "END")),
-        ramp_epochs=cfg_req_int(cl, "RAMP_EPOCHS"),
-    )
+    # p_corrupt = linear_ramp(
+    #     epoch_idx=epoch,
+    #     start_epoch=start_epoch,
+    #     start=_require_prob_01("CORRUPT.START", cfg_req_float(c, "START")),
+    #     end=_require_prob_01("CORRUPT.END", cfg_req_float(c, "END")),
+    #     ramp_epochs=cfg_req_int(c, "RAMP_EPOCHS"),
+    # )
+    # p_teacher_last = linear_ramp(
+    #     epoch_idx=epoch,
+    #     start_epoch=start_epoch,
+    #     start=_require_prob_01("TEACHER_LAST.START", cfg_req_float(tl, "START")),
+    #     end=_require_prob_01("TEACHER_LAST.END", cfg_req_float(tl, "END")),
+    #     ramp_epochs=cfg_req_int(tl, "RAMP_EPOCHS"),
+    # )
+    # p_corrupt_last = linear_ramp(
+    #     epoch_idx=epoch,
+    #     start_epoch=start_epoch,
+    #     start=_require_prob_01("CORRUPT_LAST.START", cfg_req_float(cl, "START")),
+    #     end=_require_prob_01("CORRUPT_LAST.END", cfg_req_float(cl, "END")),
+    #     ramp_epochs=cfg_req_int(cl, "RAMP_EPOCHS"),
+    # )
 
     return {
         "p_teacher": float(p_teacher),
-        "p_corrupt": float(p_corrupt),
-        "p_teacher_last": float(p_teacher_last),
-        "p_corrupt_last": float(p_corrupt_last),
+        # "p_corrupt": float(p_corrupt),
+        # "p_teacher_last": float(p_teacher_last),
+        # "p_corrupt_last": float(p_corrupt_last),
     }

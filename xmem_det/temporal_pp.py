@@ -27,7 +27,10 @@ class TemporalPointPillar(PointPillar):
 
         # Adapters
         self.bev_adapter = nn.Conv2d(c_bev, 3, kernel_size=1)
-        self.hidden_to_bev = nn.Conv2d(self.hidden_dim, c_bev, kernel_size=1)
+        self.readout_to_bev = nn.Conv2d(512, c_bev, 1)
+
+        self.readout_gru = nn.GRU(input_size=512, hidden_size=512, num_layers=1, batch_first=True)
+
 
         # Loss weights
         self.aux_occ_w = 0.5
@@ -120,6 +123,7 @@ class TemporalPointPillar(PointPillar):
         alpha_temporal: float = 1.0,
         compute_det_loss=True,
         compute_aux_loss=True,
+        use_det_t0: bool = True,
     ):
         """
         Process all frames at once.
@@ -171,12 +175,59 @@ class TemporalPointPillar(PointPillar):
         if (H, W) != (H16, W16):
             frames_rgb = F.pad(frames_rgb, (0, W16 - W, 0, H16 - H))
         
+        #get first detection masks
         first_frame_gt = gt_occ_list[0]
-        
+        mask_t0 = None
+        if use_det_t0 == True:
+            bd0 = dict(frames_list[0])
+            dh_was_training = bool(self.dense_head.training)
+            self.dense_head.eval()
+            with torch.no_grad():
+                bd0 = self.dense_head(bd0)
+
+                fwd_ret0 = self.dense_head.forward_ret_dict
+                cls_preds0 = fwd_ret0["cls_preds"]
+                box_preds0 = fwd_ret0["box_preds"]
+                dir_cls_preds0 = fwd_ret0.get("dir_cls_preds", None)
+
+                batch_cls_preds0, batch_box_preds0 = self.dense_head.generate_predicted_boxes(
+                    batch_size=bd0["batch_size"],
+                    cls_preds=cls_preds0,
+                    box_preds=box_preds0,
+                    dir_cls_preds=dir_cls_preds0,
+                )
+
+                bd0["batch_cls_preds"] = batch_cls_preds0
+                bd0["batch_box_preds"] = batch_box_preds0
+                bd0["cls_preds_normalized"] = False
+
+                if isinstance(batch_cls_preds0, list):
+                    bd0["multihead_label_mapping"] = [
+                        self.dense_head.rpn_heads[i].head_label_indices for i in range(len(batch_cls_preds0))
+                    ]
+
+                pred_dicts0, _ = self.post_processing(bd0)
+                mask_t0 = self._build_det_masks(pred_dicts0, bd0)
+                if mask_t0.dim() == 3:
+                    mask_t0 = mask_t0.unsqueeze(1)
+                if mask_t0.size(1) != 1:
+                    mask_t0 = (mask_t0.sum(dim=1, keepdim=True) > 0).to(dtype=frames_rgb.dtype)
+                else:
+                    mask_t0 = (mask_t0 > 0).to(dtype=frames_rgb.dtype)
+
+                mask_t0 = mask_t0.to(device=frames_rgb.device, dtype=frames_rgb.dtype)
+
+                if mask_t0.shape[-2:] != (H16, W16):
+                    mask_t0 = F.interpolate(mask_t0, size=(H16, W16), mode="nearest")
+            self.dense_head.train(dh_was_training)
+        else:
+            mask_t0 = first_frame_gt
+
+
         # === CALL XMEM do_pass ===
-        xmem_out, hidden = self.xmem_processor.do_pass(
+        xmem_out, memory_readout, hidden = self.xmem_processor.do_pass(
             frames=frames_rgb,
-            first_frame_gt=first_frame_gt,
+            first_frame_gt=mask_t0,
             T=T
         )
         
@@ -221,35 +272,42 @@ class TemporalPointPillar(PointPillar):
         occ_logits_last = torch.log(occ_prob_last / (1 - occ_prob_last))
         
         hidden_cur = hidden[:, 0]
-        temp = self.hidden_to_bev(hidden_cur)
+        xmem_out, readouts, hidden = self.xmem_processor.do_pass(
+            frames=frames_rgb,
+            first_frame_gt=mask_t0,
+            T=T
+        )
+
+        S = int(readouts.shape[1])
+        Bx, Sx, Cx, hk, wk = readouts.shape
+        x = readouts.permute(0, 3, 4, 1, 2).reshape(Bx * hk * wk, Sx, Cx)
+        _, h = self.readout_gru(x)
+        readout_fused = h[-1].reshape(Bx, hk, wk, Cx).permute(0, 3, 1, 2)
+
+        temp = self.readout_to_bev(readout_fused)
 
         if temp.shape[-2:] != (H, W):
             temp = F.interpolate(temp, size=(H, W), mode="bilinear", align_corners=False)
 
         bev_last = bev_list[-1]
-        bev_scale = bev_last.abs().mean(dim=1, keepdim=True) + 1e-6
-        temp_scale = temp.abs().mean(dim=1, keepdim=True) + 1e-6
-        temp = temp * (bev_scale / temp_scale)
-        
-        # Occupancy gating
-        gate = 0.2 + 0.8 * torch.sigmoid(occ_logits_last)
-        if gate.shape[-2:] != (H, W):
-            gate = gate[:, :, :H, :W]
+        # bev_scale = bev_last.abs().mean(dim=1, keepdim=True) + 1e-6
+        # temp_scale = temp.abs().mean(dim=1, keepdim=True) + 1e-6
+        # temp = temp * (bev_scale / temp_scale)
         
         # Fuse
         a = float(alpha_temporal)
-        bev_fused = bev_last + a * gate * temp
+        bev_fused = bev_last + a *  temp
 
         eps = 1e-6
-        bev_l1 = bev_last.abs().mean()
-        temp_l1 = temp.abs().mean()
-        delta_l1 = (bev_fused - bev_last).abs().mean()
+        # bev_l1 = bev_last.abs().mean()
+        # temp_l1 = temp.abs().mean()
+        # delta_l1 = (bev_fused - bev_last).abs().mean()
 
-        gate_mean = gate.mean()
-        occ_mean = torch.sigmoid(occ_logits_last).mean()
+        # gate_mean = gate.mean()
+        # occ_mean = torch.sigmoid(occ_logits_last).mean()
 
-        temp_ratio = temp_l1 / (bev_l1 + eps)
-        delta_ratio = delta_l1 / (bev_l1 + eps)
+        # temp_ratio = temp_l1 / (bev_l1 + eps)
+        # delta_ratio = delta_l1 / (bev_l1 + eps)
 
         
         # Update last frame's batch_dict
@@ -302,14 +360,14 @@ class TemporalPointPillar(PointPillar):
             tb_dict["loss_det"] = loss_det.detach() if loss_det is not None else torch.zeros((), device=dev)
             tb_dict["loss_total"] = loss_total.detach()
             
-            tb_dict["bev_l1"] = bev_l1.detach()
-            tb_dict["temp_l1"] = temp_l1.detach()
-            tb_dict["delta_l1"] = delta_l1.detach()
-            tb_dict["temp_ratio"] = temp_ratio.detach()
-            tb_dict["delta_ratio"] = delta_ratio.detach()
-            tb_dict["gate_mean"] = gate_mean.detach()
-            tb_dict["occ_mean"] = occ_mean.detach()
-            tb_dict["alpha_temporal"] = torch.as_tensor(float(alpha_temporal), device=bev_fused.device)
+            # tb_dict["bev_l1"] = bev_l1.detach()
+            # tb_dict["temp_l1"] = temp_l1.detach()
+            # tb_dict["delta_l1"] = delta_l1.detach()
+            # tb_dict["temp_ratio"] = temp_ratio.detach()
+            # tb_dict["delta_ratio"] = delta_ratio.detach()
+            # tb_dict["gate_mean"] = gate_mean.detach()
+            # tb_dict["occ_mean"] = occ_mean.detach()
+            # tb_dict["alpha_temporal"] = torch.as_tensor(float(alpha_temporal), device=bev_fused.device)
 
             B0 = int(bev_last.shape[0])
             frames_img_last = None
