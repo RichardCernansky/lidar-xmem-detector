@@ -1,3 +1,4 @@
 log/ckpt/*.pth
+log/saved_ckpt/*.pth
 log/vis/
 Xmem/

@@ -35,6 +35,37 @@ class TemporalPointPillar(PointPillar):
         # Loss weights
         self.aux_occ_w = 0.5
 
+        self.readout_to_bev = nn.Sequential(
+            nn.Conv2d(512, c_bev, 1, bias=False),
+            nn.GroupNorm(8, c_bev),
+            nn.GELU(),
+        )
+
+        self.temp_up_blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(c_bev, c_bev, 3, padding=1, bias=False),
+                nn.GroupNorm(8, c_bev),
+                nn.GELU(),
+            )
+            for _ in range(4)
+        ])
+
+        self.temp_refine = nn.Sequential(
+            nn.Conv2d(c_bev, c_bev, 3, padding=1, bias=False),
+            nn.GroupNorm(8, c_bev),
+            nn.GELU(),
+            nn.Conv2d(c_bev, c_bev, 3, padding=1, bias=True),
+        )
+
+        self.temp_gain = nn.Parameter(torch.tensor(0.0))
+
+        self.fuse = nn.Sequential(
+            nn.Conv2d(2 * c_bev, c_bev, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(c_bev, c_bev, 3, padding=1),
+        )
+
+
     def reset_sequence(self, seq_id: int):
         """Called at start of sequence"""
         pass
@@ -225,11 +256,18 @@ class TemporalPointPillar(PointPillar):
 
 
         # === CALL XMEM do_pass ===
-        xmem_out, memory_readout, hidden = self.xmem_processor.do_pass(
+        xmem_out, readouts, hidden = self.xmem_processor.do_pass(
             frames=frames_rgb,
             first_frame_gt=mask_t0,
             T=T
         )
+
+        S = int(readouts.shape[1])
+        Bx, Sx, Cx, hk, wk = readouts.shape
+        x = readouts.permute(0, 3, 4, 1, 2).reshape(Bx * hk * wk, Sx, Cx)
+        _, h = self.readout_gru(x)
+        readout_fused = h[-1].reshape(Bx, hk, wk, Cx).permute(0, 3, 1, 2)
+
         
         # === COMPUTE XMEM LOSS ON ALL FRAMES ===
         aux_occ_loss = torch.zeros((), device=frames_rgb.device)
@@ -272,32 +310,30 @@ class TemporalPointPillar(PointPillar):
         occ_logits_last = torch.log(occ_prob_last / (1 - occ_prob_last))
         
         hidden_cur = hidden[:, 0]
-        xmem_out, readouts, hidden = self.xmem_processor.do_pass(
-            frames=frames_rgb,
-            first_frame_gt=mask_t0,
-            T=T
-        )
-
-        S = int(readouts.shape[1])
-        Bx, Sx, Cx, hk, wk = readouts.shape
-        x = readouts.permute(0, 3, 4, 1, 2).reshape(Bx * hk * wk, Sx, Cx)
-        _, h = self.readout_gru(x)
-        readout_fused = h[-1].reshape(Bx, hk, wk, Cx).permute(0, 3, 1, 2)
 
         temp = self.readout_to_bev(readout_fused)
+
+        # for blk in self.temp_up_blocks:
+        #     if temp.shape[-2] >= H and temp.shape[-1] >= W:
+        #         break
+        #     temp = F.interpolate(temp, scale_factor=2, mode="bilinear", align_corners=False)
+        #     temp = blk(temp)
 
         if temp.shape[-2:] != (H, W):
             temp = F.interpolate(temp, size=(H, W), mode="bilinear", align_corners=False)
 
-        bev_last = bev_list[-1]
+        # temp = self.temp_refine(temp)
+        # temp = torch.tanh(self.temp_gain) * temp
+
+        # Fuse
+        bev_last = bev_list[-1] 
+        a = float(alpha_temporal)
+        bev_fused = bev_last + a *  temp
+        
+        #SCALE
         # bev_scale = bev_last.abs().mean(dim=1, keepdim=True) + 1e-6
         # temp_scale = temp.abs().mean(dim=1, keepdim=True) + 1e-6
         # temp = temp * (bev_scale / temp_scale)
-        
-        # Fuse
-        a = float(alpha_temporal)
-        bev_fused = bev_last + a *  temp
-
         eps = 1e-6
         # bev_l1 = bev_last.abs().mean()
         # temp_l1 = temp.abs().mean()

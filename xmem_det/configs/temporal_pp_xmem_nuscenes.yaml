@@ -1,6 +1,6 @@
 ADDONS:
   RUN:
-    PHASE: "0"
+    PHASE: "1"
     DEVICE: "cuda"
 
     LOG_DIR: "log"
@@ -14,10 +14,10 @@ ADDONS:
     CKPT_DIR: "log/ckpt"
 
     # either one of RESUME_CKPT and PRETRAINED_PP_CKPT can be set to non-null
-    # RESUME_CKPT: "/home/cernanskyr/pp_xmem_det/log/ckpt/phase1_only_seq8_epoch_9.pth"
-    RESUME_CKPT: null
-    # PRETRAINED_PP_CKPT: null
-    PRETRAINED_PP_CKPT: "/home/cernanskyr/OpenPCDet/output/cfgs/nuscenes_models/cbgs_pp_multihead/default/ckpt/checkpoint_epoch_20.pth"
+    RESUME_CKPT: "/home/cernanskyr/pp_xmem_det/log/ckpt/phase0_only_seq8_epoch_5.pth"
+    # RESUME_CKPT: null
+    PRETRAINED_PP_CKPT: null
+    # PRETRAINED_PP_CKPT: "/home/cernanskyr/OpenPCDet/output/cfgs/nuscenes_models/cbgs_pp_multihead/default/ckpt/checkpoint_epoch_20.pth"
 
     USE_CKPT_EPOCH: true
     RESUME_OPTIM_SCHED: false
@@ -76,37 +76,39 @@ ADDONS:
       CKPT_NAME_TEMPLATE: "phase{phase}_{tag}_epoch_{epoch}.pth"
 
     "1":
-      PREFIXES: ["xmem"]
+      PREFIXES: ["xmem","fuse",  "bev_adapter", "readout_to_bev", "readout_gru", 'temp_gain', 'temp_refine', 'temp_up_blocks']
 
-      START_EPOCH: 10
-      END_EPOCH: 14
+      START_EPOCH: 6
+      END_EPOCH: 10 
 
       LR_START: 1.5e-5
       LR_MAX: 1.5e-5
       LR_END: 5e-7
       WARMUP_EPOCHS: 0
 
-      ALPHA_START: 0.0
-      ALPHA_END: 0.0
-      ALPHA_RAMP_EPOCHS: 1
+      ALPHA_START: 0.3
+      ALPHA_END: 0.8
+      ALPHA_RAMP_EPOCHS: 4
 
       PROB_SCHEDULE:
         TEACHER:
-          START: 1.0 
-          END: 0
+          START: 0.0 
+          END: 0.0
           RAMP_EPOCHS: 5
 
       OPT_GROUP_SPECS:
         - PREFIXES: ["xmem"]
-          LR_MULT: 1.0
+          LR_MULT: 0.6
         - PREFIXES: ["readout_to_bev"]
           LR_MULT: 1.0
         - PREFIXES: ["dense_head"]
-          LR_MULT: 0.0
+          LR_MULT: 1.0
+        - PREFIXES: ["readout_gru"]
+          LR_MULT: 1.0
         - PREFIXES: ["backbone_2d"]
           LR_MULT: 0.0
         - PREFIXES: ["bev_adapter"]
-          LR_MULT: 0.0
+          LR_MULT: 0.6
 
 
       CKPT_NAME_TEMPLATE: "phase{phase}_{tag}_epoch_{epoch}.pth"
