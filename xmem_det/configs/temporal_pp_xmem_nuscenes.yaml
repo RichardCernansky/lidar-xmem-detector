@@ -76,7 +76,7 @@ ADDONS:
       CKPT_NAME_TEMPLATE: "phase{phase}_{tag}_epoch_{epoch}.pth"
 
     "1":
-      PREFIXES: ["xmem","fuse",  "bev_adapter", "readout_to_bev", "readout_gru", 'temp_gain', 'temp_refine', 'temp_up_blocks']
+      PREFIXES: ["xmem",  "bev_adapter", "g4_to_bev", "dense_head"] 
 
       START_EPOCH: 6
       END_EPOCH: 10 

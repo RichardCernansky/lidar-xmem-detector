@@ -1,6 +1,5 @@
 import sys
 import torch
-import torch.nn as nn
 import numpy as np
 
 XMEM_ROOT = "external/XMem/"
@@ -11,35 +10,29 @@ from model.network import XMem
 
 
 class XMemProcessor:
-    """
-    XMem processor matching XMemTrainer.do_pass() exactly.
-    """
     def __init__(self, config, device):
         self.config = config
-        self.num_ref_frames = config.get('num_ref_frames', 3)
-        self.deep_update_prob = config.get('deep_update_prob', 0.2)
-        
-        # XMem config
+        self.num_ref_frames = config.get("num_ref_frames", 3)
+        self.deep_update_prob = config.get("deep_update_prob", 0.2)
+
         xmem_cfg = {
             "single_object": True,
-            "hidden_dim": config.get('hidden_dim', 64)
+            "hidden_dim": config.get("hidden_dim", 64),
         }
-        
+
         self.XMem = XMem(xmem_cfg, model_path=None, map_location="cpu")
-        
-        # Load pretrained if specified
+
         if config.get("xmem_resume", False):
             ckpt_path = config.get("xmem_model")
             state = torch.load(ckpt_path, map_location="cpu")
             self.XMem.load_weights(state, init_as_zero_if_needed=True)
-        
+
         self.XMem.to(device)
-        
-        # Make trainable
+
         for p in self.XMem.parameters():
             p.requires_grad = True
-    
-    def do_pass(self, frames, first_frame_gt, T):
+
+    def do_pass(self, frames, first_frame_gt, T, g4_out=False):
         out = {}
 
         if frames.dim() != 4 or frames.shape[1] != 3:
@@ -56,7 +49,7 @@ class XMemProcessor:
         frames_bt = frames
         frames_bthw = frames_bt.view(b, T, 3, H, W)
 
-        key_bt, shrinkage_bt, selection_bt, f16_bt, f8_bt, f4_bt = self.XMem('encode_key', frames_bt)
+        key_bt, shrinkage_bt, selection_bt, f16_bt, f8_bt, f4_bt = self.XMem("encode_key", frames_bt)
 
         Ck, hk, wk = key_bt.shape[1], key_bt.shape[2], key_bt.shape[3]
         key = key_bt.view(b, T, Ck, hk, wk).permute(0, 2, 1, 3, 4).contiguous()
@@ -82,15 +75,16 @@ class XMemProcessor:
         f4 = f4_bt.view(b, T, C4, h4, w4).contiguous()
 
         filler_one = torch.zeros(1, dtype=torch.int64, device=frames.device)
-        hidden = torch.zeros((b, num_objects, self.config['hidden_dim'], hk, wk), device=frames.device, dtype=frames.dtype)
+        hidden = torch.zeros((b, num_objects, self.config["hidden_dim"], hk, wk), device=frames.device, dtype=frames.dtype)
 
-        v16, hidden = self.XMem('encode_value', frames_bthw[:, 0], f16[:, 0], hidden, first_frame_gt)
+        v16, hidden = self.XMem("encode_value", frames_bthw[:, 0], f16[:, 0], hidden, first_frame_gt)
         values = v16.unsqueeze(3)
 
-        out['masks_0'] = first_frame_gt
-        out['logits_0'] = None
+        out["masks_0"] = first_frame_gt
+        out["logits_0"] = None
 
         readouts = []
+        g4_out_seq = [] if g4_out else None
 
         for ti in range(1, T):
             if ti <= self.num_ref_frames:
@@ -99,51 +93,74 @@ class XMemProcessor:
                 ref_shrinkage = shrinkage[:, :, :ti] if shrinkage is not None else None
             else:
                 indices = [
-                    torch.cat([filler_one, torch.randperm(ti - 1, device=frames.device)[:self.num_ref_frames - 1] + 1])
+                    torch.cat([filler_one, torch.randperm(ti - 1, device=frames.device)[: self.num_ref_frames - 1] + 1])
                     for _ in range(b)
                 ]
                 ref_values = torch.stack([values[bi, :, :, indices[bi]] for bi in range(b)], 0)
                 ref_keys = torch.stack([key[bi, :, indices[bi]] for bi in range(b)], 0)
-                ref_shrinkage = torch.stack([shrinkage[bi, :, indices[bi]] for bi in range(b)], 0) if shrinkage is not None else None
+                ref_shrinkage = (
+                    torch.stack([shrinkage[bi, :, indices[bi]] for bi in range(b)], 0) if shrinkage is not None else None
+                )
 
             memory_readout = self.XMem(
-                'read_memory',
+                "read_memory",
                 key[:, :, ti],
                 selection[:, :, ti] if selection is not None else None,
                 ref_keys,
                 ref_shrinkage,
-                ref_values
+                ref_values,
             )
 
             readouts.append(memory_readout[:, 0])
 
-            hidden, logits, masks = self.XMem(
-                'segment',
-                (f16[:, ti], f8[:, ti], f4[:, ti]),
-                memory_readout,
-                hidden,
-                selector,
-                h_out=True
-            )
+            if g4_out:
+                hidden, logits, masks, (_, _, g4) = self.XMem(
+                    "segment",
+                    (f16[:, ti], f8[:, ti], f4[:, ti]),
+                    memory_readout,
+                    hidden,
+                    selector,
+                    h_out=True,
+                    strip_bg=True,
+                    g4_out=True,
+                )
+                g4_zero = g4[:, 0]
+                g4_out_seq.append(g4_zero)
+            else:
+                hidden, logits, masks = self.XMem(
+                    "segment",
+                    (f16[:, ti], f8[:, ti], f4[:, ti]),
+                    memory_readout,
+                    hidden,
+                    selector,
+                    h_out=True,
+                )
 
             if ti < (T - 1):
                 is_deep_update = np.random.rand() < self.deep_update_prob
                 v16, hidden = self.XMem(
-                    'encode_value',
+                    "encode_value",
                     frames_bthw[:, ti],
                     f16[:, ti],
                     hidden,
                     masks,
-                    is_deep_update=is_deep_update
+                    is_deep_update=is_deep_update,
                 )
                 values = torch.cat([values, v16.unsqueeze(3)], 3)
 
-            out[f'masks_{ti}'] = masks
-            out[f'logits_{ti}'] = logits
+            out[f"masks_{ti}"] = masks
+            out[f"logits_{ti}"] = logits
 
         if len(readouts) > 0:
             readouts = torch.stack(readouts, dim=1)
         else:
             readouts = torch.zeros((b, 0, 512, hk, wk), device=frames.device, dtype=frames.dtype)
+
+        if g4_out:
+            if len(g4_out_seq) > 0:
+                g4_out_seq = torch.stack(g4_out_seq, dim=1)
+            else:
+                g4_out_seq = torch.zeros((b, 0, 256, h4, w4), device=frames.device, dtype=frames.dtype)
+            return out, readouts, hidden, g4_out_seq
 
         return out, readouts, hidden
