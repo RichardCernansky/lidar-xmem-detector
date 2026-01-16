@@ -242,7 +242,7 @@ def main():
                 frames_rgb = torch.cat(frames_rgb_list, dim=0)
                 first_frame_gt = gt_list[0]
 
-                xmem_out, _ = model.xmem_processor.do_pass(
+                xmem_out, _, _ = model.xmem_processor.do_pass(
                     frames=frames_rgb,
                     first_frame_gt=first_frame_gt,
                     T=len(window)
