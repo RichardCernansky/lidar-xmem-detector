@@ -6,8 +6,6 @@ from pathlib import Path
 import numpy as np
 import torch
 from nuscenes.nuscenes import NuScenes
-from nuscenes.utils.geometry_utils import transform_matrix
-from pyquaternion import Quaternion
 
 from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_to_file
 from pcdet.datasets import build_dataloader
@@ -16,8 +14,8 @@ from pcdet.utils import common_utils
 from xmem_det.temporal_pp import TemporalPointPillar
 from xmem_det.util import load_xmem_train_cfg
 
+
 def deduce_alpha_from_ckpt_if_possible(blob: dict, fallback: float) -> float:
-    # return 0
     if not isinstance(blob, dict):
         return float(fallback)
 
@@ -43,11 +41,8 @@ def deduce_alpha_from_ckpt_if_possible(blob: dict, fallback: float) -> float:
 
 
 def to_torch_batch_dict(frame_dict, device):
-    """
-    OpenPCDet datasets often return a dict with numpy arrays.
-    Your TemporalPointPillar forward expects tensors on GPU for numeric arrays,
-    but should keep string/object arrays as-is.
-    """
+    # Converts OpenPCDet batch dict values into torch tensors on GPU when appropriate.
+    # Keeps strings/objects as-is (OpenPCDet stores tokens, frame ids, etc. as object arrays).
     batch_dict = {}
     for k, v in frame_dict.items():
         if isinstance(v, np.ndarray):
@@ -60,43 +55,13 @@ def to_torch_batch_dict(frame_dict, device):
         else:
             batch_dict[k] = v
 
-    """
-    OpenPCDet code relies on batch_size existing (some modules do).
-    Because we always collate with one sample here, we force batch_size=1 if missing.
-    """
+    # OpenPCDet modules assume batch_size exists in batch_dict. We run batch_size=1 always.
     if "batch_size" not in batch_dict:
         batch_dict["batch_size"] = 1
     return batch_dict
 
 
-def world_T_lidar_from_token(nusc: NuScenes, sample_token: str) -> np.ndarray:
-    """
-    Computes world_T_lidar for the LiDAR_TOP sensor at a given sample token.
-    This is needed to compute the relative motion between consecutive frames (T_rel).
-    """
-    sample = nusc.get("sample", sample_token)
-    sd_lidar = nusc.get("sample_data", sample["data"]["LIDAR_TOP"])
-    ep = nusc.get("ego_pose", sd_lidar["ego_pose_token"])
-    cs = nusc.get("calibrated_sensor", sd_lidar["calibrated_sensor_token"])
-
-    world_T_ego = transform_matrix(ep["translation"], Quaternion(ep["rotation"]), inverse=False)
-    ego_T_lidar = transform_matrix(cs["translation"], Quaternion(cs["rotation"]), inverse=False)
-    return (world_T_ego @ ego_T_lidar).astype(np.float32)
-
-
-def rel_T_curr_prev(T_world_prev: np.ndarray, T_world_curr: np.ndarray) -> np.ndarray:
-    """
-    Your model uses T_rel to motion-compensate masks/state between frames.
-    We want a transform that maps points from prev-lidar frame into curr-lidar frame:
-        T_rel = inv(T_world_curr) @ T_world_prev
-    """
-    return (np.linalg.inv(T_world_curr) @ T_world_prev).astype(np.float32)
-
-
 def fmt_hms(seconds: float) -> str:
-    """
-    Pretty printing for progress logs.
-    """
     seconds = max(0.0, float(seconds))
     s = int(seconds + 0.5)
     h = s // 3600
@@ -106,16 +71,9 @@ def fmt_hms(seconds: float) -> str:
 
 
 def steps_for_scene(n: int, seq_len: int) -> int:
-    """
-    Option 1 evaluates *each* frame as the end of a rolling window (stride=1 by definition).
-    For a scene with n frames and max context length L:
-
-    - for early frames, window sizes grow: 1,2,3,...,L
-    - then it stays L: L,L,L,... (n-L times)
-
-    Total forward steps in that scene:
-        sum_{k=1..min(n,L)} k  +  max(0, n-L) * L
-    """
+    # Counts how many forward steps total the rolling-window evaluation will do for progress/ETA.
+    # For each frame position pos in the scene, we run a window of length <= seq_len ending at pos.
+    # Total steps is sum of window lengths across all pos.
     n = int(n)
     L = int(seq_len)
     if n <= 0:
@@ -128,57 +86,33 @@ def steps_for_scene(n: int, seq_len: int) -> int:
 def parse_args():
     p = argparse.ArgumentParser()
 
-    """
-    --cfg_file: OpenPCDet YAML, contains dataset config, class names, post-processing, etc.
-    --xmem_cfg: your XMem train config (dims, checkpoint usage, etc.)
-    --ckpt: the trained TemporalPointPillar checkpoint (your custom ckpt)
-    """
     p.add_argument("--cfg_file", type=str, required=True)
     p.add_argument("--xmem_cfg", type=str, required=True)
     p.add_argument("--ckpt", type=str, required=True)
 
-    """
-    --workers: dataloader workers (only used for OpenPCDet dataset build; we do manual per-item access).
-    --split: overrides cfg.DATA_CONFIG.DATA_SPLIT['test'] to ensure you really evaluate val/test as intended.
-    --alpha: your temporal gate strength; alpha=1.0 means full temporal enhancement.
-    """
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--split", type=str, default=None)
     p.add_argument("--alpha", type=float, default=1.0)
 
-    """
-    Option 1 parameter:
-    --seq_len is the maximum context length used for each "window ending at current frame".
-    Stride is implicitly 1 in option 1 (because every frame is evaluated with its own rolling context).
-    """
     p.add_argument("--seq_len", type=int, default=8)
 
-    """
-    Output folder controls:
-    --extra_tag matches OpenPCDet convention for experiment folder separation.
-    --eval_tag creates a subfolder so you can store multiple eval variants side-by-side.
-    --log_interval controls progress logging frequency.
-    """
     p.add_argument("--extra_tag", type=str, default="default")
     p.add_argument("--eval_tag", type=str, default="opt1_window_ends_each_frame")
     p.add_argument("--log_interval", type=int, default=100)
 
-    """
-    --set allows overriding YAML keys from CLI, same as OpenPCDet scripts.
-    Example: --set DATA_CONFIG.DATA_SPLIT.test val
-    """
     p.add_argument("--set", dest="set_cfgs", default=None, nargs=argparse.REMAINDER)
 
     args = p.parse_args()
 
+    # Loads the OpenPCDet YAML config into global cfg.
     cfg_from_yaml_file(args.cfg_file, cfg)
+
+    # Optional: allow overriding cfg keys from CLI (OpenPCDet convention).
     if args.set_cfgs is not None:
         cfg_from_list(args.set_cfgs, cfg)
 
-    """
-    OpenPCDet uses cfg.DATA_CONFIG.DATA_SPLIT['test'] to decide which split annotations to load.
-    If you want val metrics, force it here.
-    """
+    # This is important: OpenPCDet uses DATA_SPLIT['test'] when building evaluation dataset.
+    # Setting --split ensures you evaluate exactly val or test as intended.
     if args.split is not None:
         cfg.DATA_CONFIG.DATA_SPLIT["test"] = args.split
 
@@ -191,16 +125,9 @@ def parse_args():
 def main():
     args = parse_args()
 
-    """
-    Some OpenPCDet setups define cfg.ROOT_DIR (usually repository root).
-    If it is missing, we fall back to current working directory so path creation still works.
-    """
     root_dir = getattr(cfg, "ROOT_DIR", Path.cwd())
 
-    """
-    Output layout matches OpenPCDet:
-      output/<EXP_GROUP_PATH>/<TAG>/<extra_tag>/eval_temporal/<eval_tag>/
-    """
+    # OpenPCDet-style output folder; eval results go into eval_temporal/<eval_tag>/.
     output_dir = Path(root_dir) / "output" / cfg.EXP_GROUP_PATH / cfg.TAG / args.extra_tag
     eval_output_dir = output_dir / "eval_temporal" / args.eval_tag
     eval_output_dir.mkdir(parents=True, exist_ok=True)
@@ -215,13 +142,9 @@ def main():
     logger.info(f"seq_len={args.seq_len}")
     log_config_to_file(cfg, logger=logger)
 
-    """
-    We build the OpenPCDet NuScenesDataset in eval mode (training=False).
-    This gives us:
-      - test_set.infos (tokens, timestamps, etc.)
-      - test_set.__getitem__ and test_set.collate_batch
-      - test_set.generate_prediction_dicts and test_set.evaluation
-    """
+    # Build NuScenesDataset in evaluation mode.
+    # Even though build_dataloader returns a DataLoader, we will not iterate it;
+    # we use test_set.__getitem__ directly so we can control temporal grouping and rolling windows.
     test_set, _, _ = build_dataloader(
         dataset_cfg=cfg.DATA_CONFIG,
         class_names=cfg.CLASS_NAMES,
@@ -232,16 +155,12 @@ def main():
         training=False,
     )
 
-    """
-    We need NuScenes API access only to group frames by scene and compute transforms (T_world_lidar).
-    """
+    # NuScenes API is used ONLY to map each sample token -> scene_token,
+    # so we can evaluate sequences in correct temporal order.
     dataroot_for_nusc = Path(cfg.DATA_CONFIG.DATA_PATH) / cfg.DATA_CONFIG.VERSION
     nusc = NuScenes(version=cfg.DATA_CONFIG.VERSION, dataroot=str(dataroot_for_nusc), verbose=False)
 
-    """
-    Group dataset indices by scene_token, and sort each scene by timestamp.
-    This provides the temporal order we want for feeding sequences.
-    """
+    # Group dataset indices by scene, and sort by timestamp so window order matches time.
     by_scene = {}
     for i, info in enumerate(test_set.infos):
         tok = info.get("token", None)
@@ -253,23 +172,16 @@ def main():
     for scene_token, idxs in by_scene.items():
         idxs.sort(key=lambda j: test_set.infos[j]["timestamp"])
 
-    """
-    Precompute totals for progress logging:
-    - total_samples = number of frames in the split (e.g. 6019 for val in trainval)
-    - total_steps = number of model forward steps (larger, because option 1 replays context windows)
-    """
     total_samples = len(test_set)
+
+    # Total forward steps is larger than total_samples because rolling window replays past frames.
     total_steps = 0
     for _, idxs in by_scene.items():
         total_steps += steps_for_scene(len(idxs), int(args.seq_len))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    """
-    Build the temporal model.
-    NOTE: Your XMem wrapper prints messages at construction time (NOT RESUMING XMEM etc.).
-    That is normal, and afterwards we load the full trained state_dict from --ckpt.
-    """
+    # Build your temporal detector. It contains XMem + fusion logic internally.
     xmem_train_cfg = load_xmem_train_cfg(args.xmem_cfg)
     model = TemporalPointPillar(
         model_cfg=cfg.MODEL,
@@ -279,44 +191,28 @@ def main():
         pc_range=cfg.DATA_CONFIG.POINT_CLOUD_RANGE,
     ).to(device)
 
-    """
-    Load your trained checkpoint.
-    Your training saves {"model_state": ...}, so we handle both that and raw state_dict.
-    """
+    # Load your checkpoint. If training saved {"model_state": ...}, we load that.
     blob = torch.load(args.ckpt, map_location="cpu")
-
-    alpha_used = deduce_alpha_from_ckpt_if_possible(
-        blob if isinstance(blob, dict) else {},
-        float(args.alpha),
-    )
+    alpha_used = deduce_alpha_from_ckpt_if_possible(blob if isinstance(blob, dict) else {}, float(args.alpha))
     logger.info(f"alpha={alpha_used}")
 
     state = blob["model_state"] if isinstance(blob, dict) and "model_state" in blob else blob
     model.load_state_dict(state, strict=True)
     model.eval()
 
-
-    """
-    We must produce a prediction for every dataset index (every frame).
-    det_annos[i] will hold the OpenPCDet-formatted annotation dict for frame i.
-    """
+    # We must generate ONE prediction per dataset frame.
+    # det_annos[i] is the OpenPCDet-format dict for sample i, which OpenPCDet will serialize to NuScenes JSON.
     det_annos = [None] * total_samples
 
     done_samples = 0
     done_steps = 0
     start_t = time.time()
 
-    """
-    OPTION 1 EVAL LOGIC (rolling window ending at each frame):
-      For each scene:
-        For each frame position pos:
-          window = last up to seq_len frames ending at pos
-          reset temporal state
-          replay the window frames in order with t_seq=0..len(window)-1
-          take the prediction of the LAST frame in that window
-          store it for the dataset index corresponding to that last frame
-    This means: every sample gets evaluated once, but with temporal context.
-    """
+    # Rolling-window evaluation:
+    # For each frame position 'pos' in a scene:
+    #   window = last up to seq_len frames ending at pos
+    #   run temporal model across that window
+    #   store prediction for the LAST frame only (the frame at pos)
     with torch.no_grad():
         win_id = 0
         for scene_token, idxs in by_scene.items():
@@ -325,105 +221,52 @@ def main():
             for pos in range(n):
                 cur_idx = idxs[pos]
 
+                # Build the window ending at current frame.
                 w_start = max(0, pos - int(args.seq_len) + 1)
                 window = idxs[w_start:pos + 1]
 
-                """
-                Very important:
-                We reset sequence state for each rolling window so evaluation is deterministic
-                and reflects "using only the past context up to seq_len".
-                """
+                # Reset temporal state for determinism: each evaluated frame uses only its own past context window.
+                # win_id is just a unique identifier; your model may ignore it.
                 model.reset_sequence(win_id)
 
-                det_instance_masks_prev = None
-                T_world_prev = None
-
+                frames_gpu = []
                 last_batch_cpu = None
-                last_pred_dicts = None
 
-                for step, idx in enumerate(window):
-                    info = test_set.infos[idx]
-                    sample_token = info["token"]
-
-                    """
-                    Build T_rel from previous to current lidar pose (for motion compensation).
-                    First step has no previous.
-                    """
-                    T_world_curr = world_T_lidar_from_token(nusc, sample_token)
-                    if T_world_prev is None:
-                        T_rel = None
-                    else:
-                        T_rel_np = rel_T_curr_prev(T_world_prev, T_world_curr)
-                        T_rel = torch.from_numpy(T_rel_np).to(device, non_blocking=True)
-
-                    """
-                    Fetch OpenPCDet frame item and collate into a batch dict (CPU),
-                    then move numeric tensors to GPU.
-                    """
+                # Collect all frames in the window as OpenPCDet batch_dicts on GPU.
+                # We keep last_batch_cpu because OpenPCDet generate_prediction_dicts expects CPU batch_dict
+                # corresponding to the frame that pred_dicts refer to (the LAST frame in the window).
+                for idx in window:
                     item = test_set.__getitem__(idx)
                     batch_cpu = test_set.collate_batch([item])
                     batch_gpu = to_torch_batch_dict(batch_cpu, device)
-
-                    """
-                    Forward temporal model:
-                      - t_seq is the step inside the window
-                      - we pass det_instance_masks_prev and T_rel so your temporal path works
-                      - compute_det_loss/aux_loss disabled for eval
-                    The model returns OpenPCDet-style pred_dicts.
-                    """
-                    pred_dicts, _, det_masks_next = model(
-                        batch_gpu,
-                        t_seq=int(step),
-                        det_instance_masks_prev=det_instance_masks_prev,
-                        T_rel=T_rel,
-                       alpha_temporal=float(alpha_used),
-                        compute_det_loss=False,
-                        compute_aux_loss=False,
-                    )
-                    
-                    # pd = pred_dicts[0]
-                    # num = int(pd["pred_boxes"].shape[0])
-                    # mx = float(pd["pred_scores"].max().item()) if num > 0 else 0.0
-                    # if done_samples % int(args.log_interval) == 0:
-                    #     logger.info(f"sample idx={idx} step={step} num_boxes={num} max_score={mx:.4f}")
-
-
-                    """
-                    Track the last frame’s prediction, because option 1 evaluates only the last timestep.
-                    """
+                    frames_gpu.append(batch_gpu)
                     last_batch_cpu = batch_cpu
-                    last_pred_dicts = pred_dicts
 
-                    """
-                    Update det_instance_masks_prev for next timestep in the window.
-                    """
-                    if isinstance(det_masks_next, torch.Tensor):
-                        det_instance_masks_prev = det_masks_next.detach()
-                    else:
-                        det_instance_masks_prev = det_masks_next
+                # This is the key call:
+                # forward_eval() should run your XMem inference core across frames_gpu in time order,
+                # extract g4 from segmentation for the last timestep, fuse into BEV, then run dense_head.
+                # Returned pred_dicts must be OpenPCDet-style predictions for the last frame only.
+                pred_dicts, recall_dicts, det_masks_next = model.forward_eval(
+                    frames_gpu,
+                    alpha_temporal=float(alpha_used),
+                    use_det_t0=True,
+                )
 
-                    T_world_prev = T_world_curr
-                    done_steps += 1
-
-                """
-                Convert last frame pred_dicts into nuScenes-format dict expected by OpenPCDet evaluation.
-                """
+                # Convert OpenPCDet pred_dicts to NuScenes JSON-compatible format.
+                # This produces a list (batch size = 1), so we take [0].
                 annos = test_set.generate_prediction_dicts(
                     batch_dict=last_batch_cpu,
-                    pred_dicts=last_pred_dicts,
+                    pred_dicts=pred_dicts,
                     class_names=cfg.CLASS_NAMES,
                     output_path=None,
                 )
                 det_annos[cur_idx] = annos[0]
 
                 done_samples += 1
+                done_steps += len(window)
                 win_id += 1
 
-                """
-                Progress logging:
-                  - sample progress: how many frames already have final predictions
-                  - step progress: how many forward steps executed (useful because option 1 is heavier)
-                """
+                # Progress logging uses done_steps because that is the true workload for rolling windows.
                 if done_samples % int(args.log_interval) == 0:
                     now = time.time()
                     elapsed = now - start_t
@@ -437,22 +280,13 @@ def main():
                         f"elapsed={fmt_hms(elapsed)} eta={fmt_hms(eta)} rate={rate:.2f} it/s"
                     )
 
-    """
-    Safety check: ensure every dataset frame got a prediction.
-    """
+    # Safety: ensure every frame got a prediction.
     missing = [i for i, a in enumerate(det_annos) if a is None]
     if missing:
         raise RuntimeError(f"Missing predictions for {len(missing)} samples, first missing index={missing[0]}")
 
-    """
-    IMPORTANT nuScenes eval edge case:
-    The nuScenes evaluation code (filter_eval_boxes) assumes the first sample in the results dict
-    has at least one predicted box; if the first sample token has an empty list, it can crash with:
-      IndexError: list index out of range
-
-    A practical workaround is to rotate det_annos so the first entry has at least one prediction.
-    This does NOT change the set of predictions; it only changes the serialization order.
-    """
+    # NuScenes evaluation sometimes crashes if the FIRST sample has zero predicted boxes.
+    # Workaround: rotate list so first entry is non-empty. This does not change the content, only order.
     first_nonempty = -1
     for i, a in enumerate(det_annos):
         names = a.get("name", [])
@@ -464,13 +298,10 @@ def main():
     if first_nonempty > 0:
         det_annos_eval = [det_annos[first_nonempty]] + det_annos[:first_nonempty] + det_annos[first_nonempty + 1 :]
 
-    """
-    Run OpenPCDet’s official evaluation for NuScenes.
-    This will:
-      - dump predictions to results_nusc.json under eval_output_dir
-      - run nuScenes detection evaluation
-      - print NDS/mAP and per-class metrics
-    """
+    # OpenPCDet runs official NuScenes detection eval here:
+    # - dumps results JSON
+    # - runs NuScenes evaluator
+    # - returns metric string + dict (NDS, mAP, per-class metrics)
     eval_metric = getattr(cfg.MODEL.POST_PROCESSING, "EVAL_METRIC", "nuscenes")
     result_str, result_dict = test_set.evaluation(
         det_annos=det_annos_eval,

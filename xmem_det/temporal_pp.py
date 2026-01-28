@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import sys
 
 from pcdet.models.detectors.pointpillar import PointPillar
 from xmem_det.util import boxes_to_bev_masks
@@ -9,6 +10,12 @@ from xmem_det.xmem_processor import XMemProcessor
 
 from xmem_det.debug_vis import dump_temporal_debug
 from xmem_det.losses import boot_bce_plus_dice
+
+XMEM_ROOT = "external/XMem/"
+if XMEM_ROOT not in sys.path:
+    sys.path.insert(0, XMEM_ROOT)
+
+from inference.inference_core import InferenceCore
 
 
 class TemporalPointPillar(PointPillar):
@@ -146,6 +153,7 @@ class TemporalPointPillar(PointPillar):
         bev_list = []
         gt_occ_list = []
         
+
         for t, batch_dict in enumerate(frames_list):
             # Standard PointPillar forward
             for cur_module in self.module_list:
@@ -342,16 +350,7 @@ class TemporalPointPillar(PointPillar):
             
             tb_dict["loss_det"] = loss_det.detach() if loss_det is not None else torch.zeros((), device=dev)
             tb_dict["loss_total"] = loss_total.detach()
-            
-            # tb_dict["bev_l1"] = bev_l1.detach()
-            # tb_dict["temp_l1"] = temp_l1.detach()
-            # tb_dict["delta_l1"] = delta_l1.detach()
-            # tb_dict["temp_ratio"] = temp_ratio.detach()
-            # tb_dict["delta_ratio"] = delta_ratio.detach()
-            # tb_dict["gate_mean"] = gate_mean.detach()
-            # tb_dict["occ_mean"] = occ_mean.detach()
-            # tb_dict["alpha_temporal"] = torch.as_tensor(float(alpha_temporal), device=bev_fused.device)
-
+         
             B0 = int(bev_last.shape[0])
             frames_img_last = None
             try:
@@ -383,3 +382,169 @@ class TemporalPointPillar(PointPillar):
 
 
         return pred_dicts, recall_dicts, det_masks_next
+    
+    def forward_eval(self, frames_list, alpha_temporal: float = 1.0, use_det_t0: bool = True, xmem_infer_cfg=None):
+        T = len(frames_list)
+        if T <= 0:
+            raise ValueError("frames_list is empty")
+
+        bev_list = []
+        gt_occ_list = []
+
+        H16 = None
+        W16 = None
+        B = None
+        H = None
+        W = None
+
+        for t in range(T):
+            bd = frames_list[t]
+            for cur_module in self.module_list:
+                if cur_module is self.dense_head:
+                    break
+                bd = cur_module(bd)
+            frames_list[t] = bd
+
+            bev = bd["spatial_features_2d"]
+            b0, c0, h0, w0 = bev.shape
+            B = b0
+            H = h0
+            W = w0
+
+            H16 = ((H + 15) // 16) * 16
+            W16 = ((W + 15) // 16) * 16
+
+            gt_occ = self._build_gt_occ_target(bd, H16, W16)
+            if gt_occ is None:
+                gt_occ = torch.zeros(B, 1, H16, W16, device=bev.device, dtype=bev.dtype)
+
+            bev_list.append(bev)
+            gt_occ_list.append(gt_occ)
+
+        if T == 1:
+            frames_list[-1] = self.dense_head(frames_list[-1])
+            pred_dicts, recall_dicts = self.post_processing(frames_list[-1])
+            det_masks_next = self._build_det_masks(pred_dicts, frames_list[-1])
+            return pred_dicts, recall_dicts, det_masks_next
+
+        bev_stack = torch.stack(bev_list, dim=0).permute(1, 2, 0, 3, 4)
+        bev_flat = bev_stack.permute(0, 2, 1, 3, 4).reshape(B * T, bev_stack.shape[1], H, W)
+        frames_rgb = self.bev_adapter(bev_flat)
+
+        if (H, W) != (H16, W16):
+            frames_rgb = F.pad(frames_rgb, (0, W16 - W, 0, H16 - H))
+
+        first_frame_gt = gt_occ_list[0]
+        if use_det_t0 is True:
+            bd0 = dict(frames_list[0])
+            dh_was_training = bool(self.dense_head.training)
+            self.dense_head.eval()
+            with torch.no_grad():
+                bd0 = self.dense_head(bd0)
+
+                fwd_ret0 = self.dense_head.forward_ret_dict
+                cls_preds0 = fwd_ret0["cls_preds"]
+                box_preds0 = fwd_ret0["box_preds"]
+                dir_cls_preds0 = fwd_ret0.get("dir_cls_preds", None)
+
+                batch_cls_preds0, batch_box_preds0 = self.dense_head.generate_predicted_boxes(
+                    batch_size=bd0["batch_size"],
+                    cls_preds=cls_preds0,
+                    box_preds=box_preds0,
+                    dir_cls_preds=dir_cls_preds0,
+                )
+
+                bd0["batch_cls_preds"] = batch_cls_preds0
+                bd0["batch_box_preds"] = batch_box_preds0
+                bd0["cls_preds_normalized"] = False
+
+                if isinstance(batch_cls_preds0, list):
+                    bd0["multihead_label_mapping"] = [
+                        self.dense_head.rpn_heads[i].head_label_indices for i in range(len(batch_cls_preds0))
+                    ]
+
+                pred_dicts0, _ = self.post_processing(bd0)
+                mask_t0 = self._build_det_masks(pred_dicts0, bd0)
+
+                if mask_t0.dim() == 3:
+                    mask_t0 = mask_t0.unsqueeze(1)
+                if mask_t0.size(1) != 1:
+                    mask_t0 = (mask_t0.sum(dim=1, keepdim=True) > 0).to(dtype=frames_rgb.dtype)
+                else:
+                    mask_t0 = (mask_t0 > 0).to(dtype=frames_rgb.dtype)
+
+                mask_t0 = mask_t0.to(device=frames_rgb.device, dtype=frames_rgb.dtype)
+                if mask_t0.shape[-2:] != (H16, W16):
+                    mask_t0 = F.interpolate(mask_t0, size=(H16, W16), mode="nearest")
+            self.dense_head.train(dh_was_training)
+        else:
+            mask_t0 = first_frame_gt.to(device=frames_rgb.device, dtype=frames_rgb.dtype)
+            if mask_t0.shape[-2:] != (H16, W16):
+                mask_t0 = F.interpolate(mask_t0, size=(H16, W16), mode="nearest")
+
+        if xmem_infer_cfg is None:
+            c = getattr(self.xmem_processor, "config", {})
+            xmem_infer_cfg= {
+            "mem_every": 1,
+            "max_mid_term_frames": 8,
+            "min_mid_term_frames": 2,
+            "num_prototypes": 64,
+            "max_long_term_elements": 1024,
+            "enable_long_term": True,
+            "enable_long_term_count_usage": True,
+            "top_k": 30,
+            "benchmark": False,
+            "single_object": True,
+            "hidden_dim": 64,
+            "deep_update_every": 4,
+        }
+
+        frames_seq = frames_rgb.reshape(B, T, 3, H16, W16)
+
+        labels = [1]
+        g4_last_list = []
+
+        for b in range(B):
+            proc = InferenceCore(self.xmem, config=xmem_infer_cfg)
+            proc.clear_memory()
+            proc.set_all_labels(labels)
+
+            m0 = (mask_t0[b, 0] > 0).to(dtype=frames_seq.dtype).unsqueeze(0)
+
+            g4_last = None
+            for ti in range(T):
+                rgb = frames_seq[b, ti]
+                if ti == 0:
+                    _,_ = proc.step(rgb, m0, labels, end=(ti == T - 1), g4_out=False)
+                else:
+                    pred_prob, g4 = proc.step(rgb, m0, labels, end=(ti == T - 1), g4_out=True)
+                if ti == T - 1:
+                    g4_last = g4
+                    if g4_last.dim() == 5:
+                        g4_last = g4_last[:, -1]
+            g4_last_list.append(g4_last)
+
+        bev_last = bev_list[-1]
+    
+        # if g4.dim() == 3:
+        #     g4 = g4.unsqueeze(0)
+        # if pred_prob.dim() == 3:
+        #     pred_prob = pred_prob.unsqueeze(0)
+        # fg = pred_prob[:, 1:2].clamp(1e-5, 1 - 1e-5)
+        # fg_logit = torch.log(fg / (1 - fg))
+        # if fg_logit.shape[-2:] != g4.shape[-2:]:
+        #     fg_logit = F.interpolate(fg_logit, size=g4.shape[-2:], mode="nearest")
+        # g4_last = torch.cat([g4_last, fg_logit.to(dtype=g4_last.dtype)], dim=1)
+
+        temp4 = self.g4_to_bev(g4_last)
+        temp = F.interpolate(temp4, size=(H, W), mode="bilinear", align_corners=False)
+        bev_fused = bev_last + float(alpha_temporal) * temp
+
+        frames_list[-1]["spatial_features_2d"] = bev_fused
+        frames_list[-1] = self.dense_head(frames_list[-1])
+
+        pred_dicts, recall_dicts = self.post_processing(frames_list[-1])
+        det_masks_next = self._build_det_masks(pred_dicts, frames_list[-1])
+
+        return pred_dicts, recall_dicts, det_masks_next
+

@@ -14,7 +14,7 @@ ADDONS:
     CKPT_DIR: "log/ckpt"
 
     # either one of RESUME_CKPT and PRETRAINED_PP_CKPT can be set to non-null
-    RESUME_CKPT: "/home/cernanskyr/pp_xmem_det/log/ckpt/phase0_only_seq8_epoch_5.pth"
+    RESUME_CKPT: "/home/cernanskyr/pp_xmem_det/log/ckpt/phase1_only_seq8_epoch_9.pth"
     # RESUME_CKPT: null
     PRETRAINED_PP_CKPT: null
     # PRETRAINED_PP_CKPT: "/home/cernanskyr/OpenPCDet/output/cfgs/nuscenes_models/cbgs_pp_multihead/default/ckpt/checkpoint_epoch_20.pth"
@@ -43,7 +43,8 @@ ADDONS:
 
   PHASES:
     "0":
-      PREFIXES: ["xmem", "bev_adapter"]
+      # PREFIXES: ["xmem", "bev_adapter"]
+      PREFIXES: ["xmem"]
 
       START_EPOCH: 0
       END_EPOCH: 10 
@@ -78,16 +79,16 @@ ADDONS:
     "1":
       PREFIXES: ["xmem",  "bev_adapter", "g4_to_bev", "dense_head"] 
 
-      START_EPOCH: 6
-      END_EPOCH: 10 
+      START_EPOCH: 10
+      END_EPOCH: 15
 
-      LR_START: 1.5e-5
-      LR_MAX: 1.5e-5
-      LR_END: 5e-7
+      LR_START: 3e-7
+      LR_MAX: 3e-7
+      LR_END: 1e-8
       WARMUP_EPOCHS: 0
 
-      ALPHA_START: 0.3
-      ALPHA_END: 0.8
+      ALPHA_START: 1.0
+      ALPHA_END: 1.6
       ALPHA_RAMP_EPOCHS: 4
 
       PROB_SCHEDULE:
