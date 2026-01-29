@@ -193,10 +193,10 @@ def train_one_epoch(
         # print("use_det_t0:", use_det_t0)
         ret_dict, tb_dict, disp_dict, det_masks = model(
             frames_list=frames_list,
-            alpha_temporal=float(alpha_temporal),
+            # alpha_temporal=float(alpha_temporal),
             compute_det_loss=True,
-            compute_aux_loss=True,
-            use_det_t0=use_det_t0,
+            # compute_aux_loss=False,
+            # use_det_t0=use_det_t0,
         )
 
 
@@ -426,7 +426,7 @@ def main():
         model_cfg=cfg.MODEL,
         num_class=num_class,
         dataset=train_set.base,
-        xmem_train_cfg=xmem_train_cfg,
+        # xmem_train_cfg=xmem_train_cfg,
         pc_range=pc_range,
     )
     model.to(device)

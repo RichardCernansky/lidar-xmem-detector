@@ -1,6 +1,6 @@
 ADDONS:
   RUN:
-    PHASE: "1"
+    PHASE: "0"
     DEVICE: "cuda"
 
     LOG_DIR: "log"
@@ -14,10 +14,10 @@ ADDONS:
     CKPT_DIR: "log/ckpt"
 
     # either one of RESUME_CKPT and PRETRAINED_PP_CKPT can be set to non-null
-    RESUME_CKPT: "/home/cernanskyr/pp_xmem_det/log/ckpt/phase1_only_seq8_epoch_9.pth"
-    # RESUME_CKPT: null
+    # RESUME_CKPT: "/home/cernanskyr/pp_xmem_det/log/ckpt/phase1_only_seq8_epoch_9.pth"
+    RESUME_CKPT: null
     PRETRAINED_PP_CKPT: null
-    # PRETRAINED_PP_CKPT: "/home/cernanskyr/OpenPCDet/output/cfgs/nuscenes_models/cbgs_pp_multihead/default/ckpt/checkpoint_epoch_20.pth"
+    PRETRAINED_PP_CKPT: "/home/cernanskyr/OpenPCDet/output/cfgs/nuscenes_models/cbgs_pp_multihead/default/ckpt/checkpoint_epoch_20.pth"
 
     USE_CKPT_EPOCH: true
     RESUME_OPTIM_SCHED: false
@@ -44,19 +44,19 @@ ADDONS:
   PHASES:
     "0":
       # PREFIXES: ["xmem", "bev_adapter"]
-      PREFIXES: ["xmem"]
+      PREFIXES: ["bank"]
 
       START_EPOCH: 0
       END_EPOCH: 10 
 
-      LR_START: 1e-5
-      LR_MAX: 1e-5
+      LR_START: 3e-5
+      LR_MAX: 3e-5
       LR_END: 1e-6
       WARMUP_EPOCHS: 0
 
-      ALPHA_START: 0.0
-      ALPHA_END: 0.0
-      ALPHA_RAMP_EPOCHS: 1
+      ALPHA_START: 1.0  
+      ALPHA_END: 1.0
+      ALPHA_RAMP_EPOCHS: 5
 
       PROB_SCHEDULE:
         TEACHER:
@@ -65,12 +65,10 @@ ADDONS:
           RAMP_EPOCHS: 1
 
       OPT_GROUP_SPECS:
-        - PREFIXES: ["xmem"]
-          LR_MULT: 1.0 
-        - PREFIXES: [bev_adapter"]
-          LR_MULT: 1.0 
         - PREFIXES: ["dense_head"]
           LR_MULT: 0.0
+        - PREFIXES: ["bank"]
+          LR_MULT: 1.0
         - PREFIXES: ["backbone_2d"]
           LR_MULT: 0.0
 
@@ -386,7 +384,7 @@ OPTIMIZATION:
   MOMENTUM: 0.9
 
 TRAIN:
-  SEQ_LEN: 9  
+  SEQ_LEN: 8  
   STRIDE: 4
   VAL_EVAL_INTERVAL: 1
   LOG_INTERVAL: 50

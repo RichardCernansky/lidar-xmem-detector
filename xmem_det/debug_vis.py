@@ -8,18 +8,6 @@ import matplotlib.pyplot as plt
 ArrayLike = Union[np.ndarray, None]
 
 
-def _agg2d(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-    if x is None:
-        return None
-    if x.dim() == 4:
-        return x.abs().mean(dim=1, keepdim=False)
-    if x.dim() == 3:
-        return x.abs().mean(dim=1, keepdim=False)
-    if x.dim() == 2:
-        return x
-    return x.reshape(-1)
-
-
 def _to_numpy_2d(x: torch.Tensor) -> np.ndarray:
     return x.detach().float().cpu().numpy()
 
@@ -85,6 +73,32 @@ def _save_grid(out_path: str, panels, titles, ncols: int = 3) -> None:
     plt.close(fig)
 
 
+
+def _agg2d(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if x is None:
+        return None
+    if x.dim() == 4:
+        return x.abs().mean(dim=1, keepdim=False)
+    if x.dim() == 3:
+        return x.abs().mean(dim=0, keepdim=False)
+    if x.dim() == 2:
+        return x
+    return x.reshape(-1)
+
+def _ref_percentiles(x: np.ndarray, p_lo: float = 1.0, p_hi: float = 99.0):
+    x = x.astype(np.float32)
+    a = float(np.percentile(x, p_lo))
+    b = float(np.percentile(x, p_hi))
+    if b - a < 1e-8:
+        b = a + 1.0
+    return a, b
+
+def _norm01_ref(x: np.ndarray, a: float, b: float) -> np.ndarray:
+    x = x.astype(np.float32)
+    d = float(b - a) if float(b - a) > 1e-8 else 1.0
+    y = (x - float(a)) / d
+    return np.clip(y, 0.0, 1.0)
+
 def dump_temporal_debug(
     batch_dict: dict,
     t_seq: int,
@@ -112,12 +126,30 @@ def dump_temporal_debug(
     if b >= B:
         b = B - 1
 
-    bev_mag = _agg2d(bev[b:b + 1])[0]
-    bevf_mag = _agg2d(bev_fused[b:b + 1])[0]
-    temp_mag = _agg2d(temp[b:b + 1])[0]
-    hid_mag = _agg2d(hidden_cur[b:b + 1])[0]
-    hid_std = hidden_cur[b].detach().float().std(dim=0)
-    delta_mag = (bev_fused[b:b + 1] - bev[b:b + 1]).abs().mean(dim=1)[0]
+    bev_mag_t = _agg2d(bev[b:b + 1])[0]
+    bevf_mag_t = _agg2d(bev_fused[b:b + 1])[0]
+    temp_mag_t = _agg2d(temp[b:b + 1])[0]
+    delta_mag_t = (bev_fused[b:b + 1] - bev[b:b + 1]).abs().mean(dim=1)[0]
+
+    bev_mag = _to_numpy_2d(bev_mag_t)
+    bevf_mag = _to_numpy_2d(bevf_mag_t)
+    temp_mag = _to_numpy_2d(temp_mag_t)
+    delta_mag = _to_numpy_2d(delta_mag_t)
+
+    a_ref, b_ref = _ref_percentiles(bev_mag, 1.0, 99.0)
+
+    bev_mean = float(np.mean(np.abs(bev_mag)))
+    temp_mean = float(np.mean(np.abs(temp_mag)))
+    delta_mean = float(np.mean(np.abs(delta_mag)))
+    eps = 1e-8
+    r_temp = temp_mean / (bev_mean + eps)
+    r_delta = delta_mean / (bev_mean + eps)
+
+    hid_mag = None
+    hid_std = None
+    if hidden_cur is not None:
+        hid_mag = _agg2d(hidden_cur[b:b + 1])[0]
+        hid_std = hidden_cur[b].detach().float().std(dim=0)
 
     occ_prob = None
     if occ_logits is not None:
@@ -146,12 +178,12 @@ def dump_temporal_debug(
         rgb = _to_numpy_rgb(frames_img[b])
 
     panels: List[ArrayLike] = [
-        _norm01(_to_numpy_2d(bev_mag)),
-        _norm01(_to_numpy_2d(temp_mag)),
-        _norm01(_to_numpy_2d(delta_mag)),
-        _norm01(_to_numpy_2d(bevf_mag)),
-        _norm01(_to_numpy_2d(hid_mag)),
-        _norm01(_to_numpy_2d(hid_std)),
+        _norm01_ref(bev_mag, a_ref, b_ref),
+        _norm01_ref(temp_mag, a_ref, b_ref),
+        _norm01_ref(delta_mag, a_ref, b_ref),
+        _norm01_ref(bevf_mag, a_ref, b_ref),
+        None if hid_mag is None else _norm01(_to_numpy_2d(hid_mag)),
+        None if hid_std is None else _norm01(_to_numpy_2d(hid_std)),
         None if occ_prob is None else _norm01(_to_numpy_2d(occ_prob)),
         None if gt is None else _norm01(_to_numpy_2d(gt)),
         None if occ_err is None else _norm01(_to_numpy_2d(occ_err)),
@@ -160,10 +192,10 @@ def dump_temporal_debug(
     ]
 
     titles = [
-        "bev_mag",
-        "temp_mag",
-        "delta_mag",
-        "bev_fused_mag",
+        f"bev_mag (ref)",
+        f"temp_mag (ref) r={r_temp:.3e}",
+        f"delta_mag (ref) r={r_delta:.3e}",
+        "bev_fused_mag (ref)",
         "hidden_mag",
         "hidden_std",
         "occ_prob",
