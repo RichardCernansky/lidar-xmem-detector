@@ -204,6 +204,7 @@ def train_one_epoch(
         
         # Backprop
         optimizer.zero_grad()
+        torch.autograd.set_detect_anomaly(True)
         loss.backward()
         clip_grad_norm_(model.parameters(), float(max_grad_norm))
         optimizer.step()

@@ -15,7 +15,7 @@ from pcdet.utils import common_utils
 
 from xmem_det.temporal_pp import TemporalPointPillar
 from xmem_det.util import load_xmem_train_cfg
-from xmem_det.debug_vis import dump_xmem_sequence_vis
+from xmem_det.visualizer import dump_xmem_sequence_vis
 
 
 VIS_MAX_SEQS = 50

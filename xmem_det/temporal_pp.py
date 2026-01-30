@@ -5,7 +5,7 @@ import numpy as np
 
 from pcdet.models.detectors.pointpillar import PointPillar
 from xmem_det.util import boxes_to_bev_masks
-from xmem_det.debug_vis import dump_temporal_debug
+from xmem_det.visualizer import TemporalDebugger
 from xmem_det.memory_fuser import ReasonNetTemporalBank
 
 
@@ -30,9 +30,10 @@ class TemporalPointPillar(PointPillar):
         self.pc_range = pc_range
 
         self.c_bev = int(self.backbone_2d.num_bev_features)
-        self.bank = ReasonNetTemporalBank(c_bev=self.c_bev, key_dim=int(key_dim), max_frames=int(max_bank_frames))
+        self.bank = ReasonNetTemporalBank(c_bev=self.c_bev, key_dim=int(key_dim))
 
         self.debug_last = {}
+        self.vis_counter = 0
 
     def reset_sequence(self, seq_id: int):
         self.bank.reset()
@@ -256,12 +257,27 @@ class TemporalPointPillar(PointPillar):
         dbg_last = None
         mp_last = None
 
+        # debugger = TemporalDebugger(
+        #     save_dir='./temporal_debug_epoch5',
+        #     log_every=5  # Visualize every 5 frames
+        # )
+        
+
+
         # Step 2: Temporal processing with memory bank
         for t in range(T):
             bev_t = bev_list[t]
             
             # Compute fused features
             mfused_t, dbg_t = self.bank.compute_mfused(bev_t)
+
+            #DEBUG
+            # bev_detached = bev_t.detach()
+            # mfused_detached = mfused_t.detach()
+            # dbg_detached = {k: v.detach() if isinstance(v, torch.Tensor) else v 
+            #                 for k, v in dbg_t.items()}
+
+            # debugger.log_frame(self.bank, t, bev_detached, mfused_detached, dbg_detached)
             
             # Generate Mp: 7-channel BEV map (NOT binary masks!)
             mp_t = self._get_bev_map_from_head_nograd(frames_list[t], mfused_t)
@@ -274,9 +290,13 @@ class TemporalPointPillar(PointPillar):
                 dbg_last = dbg_t
                 mp_last = mp_t
 
+        # debugger.save_sequence_summary(seq_name=f'seq{self.vis_counter:03d}')
+        self.vis_counter += 1
+
         # Step 3: Final detection on last frame
         frames_list[-1]["spatial_features_2d"] = mfused_last
         frames_list[-1] = self.dense_head(frames_list[-1])
+
 
         if self.training and compute_det_loss:
             loss_det, tb_dict, disp_dict = self.get_training_loss()
@@ -294,3 +314,4 @@ class TemporalPointPillar(PointPillar):
         frames_list[-1] = self._fill_postproc_inputs(frames_list[-1])
         pred_dicts, recall_dicts = self.post_processing(frames_list[-1])
         return pred_dicts, recall_dicts, None
+    
