@@ -8320,3 +8320,4 @@
 2026-01-30 16:04:18,087   INFO  epoch 1/10, seq 550/6224, loss 0.8765, det 0.8765, occ 0.0000, cons 0.0000, win200 loss 1.5976, det 1.5976, occ 0.0000, cons 0.0000, cls 0.5062, win200_cls 0.8949, loc 0.3704, win200_loc 0.7028, lr 2.999443e-05
 2026-01-30 16:05:10,230   INFO  epoch 1/10, seq 600/6224, loss 1.0426, det 1.0426, occ 0.0000, cons 0.0000, win200 loss 1.4527, det 1.4527, occ 0.0000, cons 0.0000, cls 0.6168, win200_cls 0.7988, loc 0.4258, win200_loc 0.6538, lr 2.999337e-05
 2026-01-30 16:06:02,255   INFO  epoch 1/10, seq 650/6224, loss 1.8012, det 1.8012, occ 0.0000, cons 0.0000, win200 loss 1.3537, det 1.3537, occ 0.0000, cons 0.0000, cls 1.5236, win200_cls 0.7382, loc 0.2776, win200_loc 0.6156, lr 2.999222e-05
+2026-01-30 16:06:54,302   INFO  epoch 1/10, seq 700/6224, loss 0.4836, det 0.4836, occ 0.0000, cons 0.0000, win200 loss 1.2644, det 1.2644, occ 0.0000, cons 0.0000, cls 0.2461, win200_cls 0.6787, loc 0.2376, win200_loc 0.5857, lr 2.999098e-05
