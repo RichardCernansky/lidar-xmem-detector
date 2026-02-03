@@ -8,6 +8,11 @@ from xmem_det.util import boxes_to_bev_masks
 from xmem_det.visualizer import TemporalDebugger
 from xmem_det.memory_fuser import ReasonNetTemporalBank
 
+import os
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+
 
 class TemporalPointPillar(PointPillar):
     """
@@ -122,108 +127,112 @@ class TemporalPointPillar(PointPillar):
         out[:, :C] = bev
         return out
 
-    def _get_bev_map_from_head_nograd(self, batch_dict_in: dict, mfused_t: torch.Tensor) -> torch.Tensor:
+    def _extract_mp_from_centerpoint(self, pred_dict: dict, H: int, W: int) -> torch.Tensor:
         """
-        Generate Mp: the 7-channel BEV map prediction from mfused_t
-        Channels: [existence_prob, x_offset, y_offset, w, h, heading, velocity]
+        Extract 7-channel Mp_t from CenterPoint predictions.
         
-        Handles flattened predictions from multi-head configuration.
+        CenterPoint pred_dict structure:
+        {
+            'hm': [B, num_classes, H, W],     # Heatmap
+            'center': [B, 2, H, W],           # XY offset
+            'center_z': [B, 1, H, W],         # Z coordinate
+            'dim': [B, 3, H, W],              # log(l, w, h)
+            'rot': [B, 2, H, W],              # cos, sin
+            'vel': [B, 2, H, W],              # vx, vy (optional)
+        }
+        
+        ReasonNet Mp_t channels:
+        [0] existence_prob
+        [1] x_offset
+        [2] y_offset  
+        [3] w (width)
+        [4] h (length)
+        [5] heading
+        [6] velocity_magnitude
         """
-        dh_was_training = bool(self.dense_head.training)
-        self.dense_head.eval()
+        B = pred_dict['hm'].shape[0]
+        device = pred_dict['hm'].device
+        dtype = pred_dict['hm'].dtype
+        
+        mp = torch.zeros(B, 7, H, W, device=device, dtype=dtype)
+        
+        # Channel 0: Object existence (max probability over all classes)
+        # Apply sigmoid to convert logits to probabilities
+        hm_sigmoid = pred_dict['hm'].sigmoid()  # [B, num_classes, H, W]
+        mp[:, 0:1] = hm_sigmoid.max(dim=1, keepdim=True)[0]  # [B, 1, H, W]
+        
+        # Channels 1-2: XY offset from grid center
+        mp[:, 1:3] = pred_dict['center']  # [B, 2, H, W]
+        
+        # Channels 3-4: Box dimensions (width, length)
+        # CenterPoint predicts log(dims), so exp to get actual dimensions
+        dim_exp = pred_dict['dim'].exp()  # [B, 3, H, W] -> [l, w, h]
+        mp[:, 3] = dim_exp[:, 1]  # w (width)
+        mp[:, 4] = dim_exp[:, 0]  # l (length) - often called 'h' in BEV
+        
+        # Channel 5: Heading angle
+        # Convert (cos, sin) to angle
+        rot_cos = pred_dict['rot'][:, 0:1]  # [B, 1, H, W]
+        rot_sin = pred_dict['rot'][:, 1:2]  # [B, 1, H, W]
+        mp[:, 5:6] = torch.atan2(rot_sin, rot_cos)  # [B, 1, H, W]
+        
+        # Channel 6: Velocity magnitude
+        if 'vel' in pred_dict:
+            vel_x = pred_dict['vel'][:, 0:1]  # [B, 1, H, W]
+            vel_y = pred_dict['vel'][:, 1:2]  # [B, 1, H, W]
+            mp[:, 6:7] = torch.sqrt(vel_x**2 + vel_y**2 + 1e-8)  # [B, 1, H, W]
+        else:
+            mp[:, 6:7] = 0.0
+        
+        return mp
 
+
+    def _get_mp_from_head_nograd(self, batch_dict_in: dict, mfused_t: torch.Tensor) -> torch.Tensor:
+        """
+        Generate Mp_t: 7-channel BEV map from CenterPoint head.
+        This runs the detection head in eval mode with no gradients.
+        """
+        # Save training state
+        was_training = self.dense_head.training
+        self.dense_head.eval()
+        
         with torch.no_grad():
+            # Create a copy to avoid modifying original
             bd = dict(batch_dict_in)
-            bd["spatial_features_2d"] = mfused_t
+            bd['spatial_features_2d'] = mfused_t
             
-            # Forward through detection head
+            # Forward through CenterPoint head
             bd = self.dense_head(bd)
             
-            # Get the raw predictions from the head
-            fwd_ret = self.dense_head.forward_ret_dict
+            # Get predictions from forward_ret_dict
+            pred_dicts = self.dense_head.forward_ret_dict['pred_dicts']
             
-            cls_preds = fwd_ret["cls_preds"]  # List of [B, num_anchors*H*W, num_classes]
-            box_preds = fwd_ret["box_preds"]  # List of [B, num_anchors*H*W, box_code_size]
-            
+            # CenterPoint uses multiple heads (one per class group)
+            # We'll aggregate them by taking max existence probability
             B, C, H, W = mfused_t.shape
             
-            # Generate Mp from flattened predictions
-            mp = self._aggregate_flattened_predictions(
-                cls_preds, box_preds, B, H, W, 
-                mfused_t.device, mfused_t.dtype
-            )
+            mp_combined = torch.zeros(B, 7, H, W, device=mfused_t.device, dtype=mfused_t.dtype)
             
-        self.dense_head.train(dh_was_training)
-        return mp
-
-    def _aggregate_flattened_predictions(self, cls_preds_list, box_preds_list, B, H, W, device, dtype):
-        """
-        Aggregate flattened predictions from multiple detection heads.
+            # Aggregate predictions from all heads
+            for head_idx, pred_dict in enumerate(pred_dicts):
+                mp_head = self._extract_mp_from_centerpoint(pred_dict, H, W)
+                
+                # For existence channel, take max across heads
+                mp_combined[:, 0] = torch.max(mp_combined[:, 0], mp_head[:, 0])
+                
+                # For other channels, use values from head with highest existence
+                mask = mp_head[:, 0] > mp_combined[:, 0]  # [B, H, W]
+                for c in range(1, 7):
+                    mp_combined[:, c] = torch.where(
+                        mask,
+                        mp_head[:, c],
+                        mp_combined[:, c]
+                    )
         
-        Args:
-            cls_preds_list: List of [B, num_anchors*H*W, num_classes]
-            box_preds_list: List of [B, num_anchors*H*W, box_code_size]
-        """
-        # Initialize output: 7 channels [existence, x, y, w, h, heading, vel]
-        mp = torch.zeros(B, 7, H, W, device=device, dtype=dtype)
-        max_existence = torch.zeros(B, H, W, device=device, dtype=dtype)
+        # Restore training state
+        self.dense_head.train(was_training)
         
-        for head_idx, (cls_pred, box_pred) in enumerate(zip(cls_preds_list, box_preds_list)):
-            # cls_pred: [B, num_anchors*H*W, num_classes]
-            # box_pred: [B, num_anchors*H*W, box_code_size]
-            
-            total_predictions = cls_pred.shape[1]
-            num_classes = cls_pred.shape[2]
-            box_code_size = box_pred.shape[2]
-            
-            # Infer number of anchors
-            num_anchors = total_predictions // (H * W)
-            
-            # Reshape to spatial format: [B, num_anchors, H, W, num_classes]
-            cls_pred_spatial = cls_pred.view(B, num_anchors, H, W, num_classes)
-            box_pred_spatial = box_pred.view(B, num_anchors, H, W, box_code_size)
-            
-            # Permute to [B, num_anchors, num_classes, H, W]
-            cls_pred_spatial = cls_pred_spatial.permute(0, 1, 4, 2, 3)
-            # Permute to [B, num_anchors, box_code_size, H, W]
-            box_pred_spatial = box_pred_spatial.permute(0, 1, 4, 2, 3)
-            
-            # Get existence probability (max over classes, then over anchors)
-            cls_prob = torch.sigmoid(cls_pred_spatial)  # [B, num_anchors, num_classes, H, W]
-            
-            # Max over classes
-            max_prob_per_anchor, _ = cls_prob.max(dim=2)  # [B, num_anchors, H, W]
-            # Max over anchors
-            existence_prob, max_anchor_idx = max_prob_per_anchor.max(dim=1)  # [B, H, W]
-            
-            # Update mask: where this head has higher confidence
-            update_mask = existence_prob > max_existence  # [B, H, W]
-            max_existence = torch.where(update_mask, existence_prob, max_existence)
-            
-            # Extract box predictions for best anchor at each location
-            # box_pred_spatial: [B, num_anchors, box_code_size, H, W]
-            # We need to select along the num_anchors dimension using max_anchor_idx
-            
-            # Expand max_anchor_idx to match box dimensions
-            max_anchor_idx_expanded = max_anchor_idx.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, H, W]
-            max_anchor_idx_expanded = max_anchor_idx_expanded.expand(-1, -1, box_code_size, -1, -1)  # [B, 1, box_code_size, H, W]
-            
-            # Gather the boxes from the selected anchors
-            selected_boxes = torch.gather(box_pred_spatial, dim=1, index=max_anchor_idx_expanded)  # [B, 1, box_code_size, H, W]
-            selected_boxes = selected_boxes.squeeze(1)  # [B, box_code_size, H, W]
-            
-            # Update mp where this head is more confident
-            mp[:, 0] = torch.where(update_mask, existence_prob, mp[:, 0])
-            
-            # Update box parameters (up to 6 channels: x, y, z, w, l, h)
-            for i in range(min(6, box_code_size)):
-                mp[:, i + 1] = torch.where(
-                    update_mask,
-                    selected_boxes[:, i],  # [B, H, W]
-                    mp[:, i + 1]           # [B, H, W]
-                )
-        
-        return mp
+        return mp_combined
 
     def forward(self, frames_list, compute_det_loss: bool = True):
         T = len(frames_list)
@@ -231,7 +240,6 @@ class TemporalPointPillar(PointPillar):
             raise ValueError("frames_list is empty")
 
         bev_list = []
-        gt_occ_list = []
 
         # Step 1: Extract BEV features from all frames
         for t in range(T):
@@ -242,62 +250,69 @@ class TemporalPointPillar(PointPillar):
                 bd = cur_module(bd)
             frames_list[t] = bd
             bev = bd["spatial_features_2d"]
-            B, C, H, W = bev.shape
-            
-            gt_occ = self._build_gt_occ_target(bd, H, W)
-            if gt_occ is None:
-                gt_occ = torch.zeros(B, 1, H, W, device=bev.device, dtype=bev.dtype)
-            
             bev_list.append(bev)
-            gt_occ_list.append(gt_occ)
 
+        # Step 2: Reset temporal bank for new sequence
         self.bank.reset()
         
         mfused_last = None
         dbg_last = None
         mp_last = None
 
-        # debugger = TemporalDebugger(
-        #     save_dir='./temporal_debug_epoch5',
-        #     log_every=5  # Visualize every 5 frames
-        # )
-        
+        # Optional visualization
+        do_viz = self.training and (self.vis_counter < 5)
+        debugger = None
+        if do_viz:
+            debugger = TemporalDebugger(
+                save_dir="./temporal_debug",
+                log_every=1,
+                max_batches=1
+            )
+            debugger.start_sequence(seq_name=f"seq{self.vis_counter:03d}")
 
-
-        # Step 2: Temporal processing with memory bank
+        # Step 2: Temporal reasoning loop
         for t in range(T):
             bev_t = bev_list[t]
             
-            # Compute fused features
+            # Compute temporally-fused features
             mfused_t, dbg_t = self.bank.compute_mfused(bev_t)
-
-            #DEBUG
-            # bev_detached = bev_t.detach()
-            # mfused_detached = mfused_t.detach()
-            # dbg_detached = {k: v.detach() if isinstance(v, torch.Tensor) else v 
-            #                 for k, v in dbg_t.items()}
-
-            # debugger.log_frame(self.bank, t, bev_detached, mfused_detached, dbg_detached)
             
-            # Generate Mp: 7-channel BEV map (NOT binary masks!)
-            mp_t = self._get_bev_map_from_head_nograd(frames_list[t], mfused_t)
+            # Generate Mp_t from CenterPoint predictions (no gradient)
+            mp_t = self._get_mp_from_head_nograd(frames_list[t], mfused_t)
             
-            # Update memory bank with query, fused features, and BEV map
+            # Update memory bank
             self.bank.update_bank(dbg_t["q_t"], mfused_t, mp_t)
             
+            # Visualization
+            if do_viz:
+                bank_state = self.bank.get_debug_state()
+                bank_maps = self.bank.get_debug_maps(batch_idx=0)
+                debugger.log_timestep(
+                    t=t,
+                    bev_t=bev_t,
+                    mfused_t=mfused_t,
+                    mp_t=mp_t,
+                    bank_state=bank_state,
+                    bank_maps=bank_maps,
+                    mem_kinds=dbg_t["mem_kinds"],
+                    batch_idx=0
+                )
+
+            # Save last frame outputs
             if t == T - 1:
                 mfused_last = mfused_t
                 dbg_last = dbg_t
                 mp_last = mp_t
 
-        # debugger.save_sequence_summary(seq_name=f'seq{self.vis_counter:03d}')
-        self.vis_counter += 1
+        if do_viz:
+            debugger.finish_sequence()
+            self.vis_counter += 1
 
-        # Step 3: Final detection on last frame
+        # Step 3: Detection on last frame only
         frames_list[-1]["spatial_features_2d"] = mfused_last
         frames_list[-1] = self.dense_head(frames_list[-1])
 
-
+        # Step 4: Compute loss or return predictions
         if self.training and compute_det_loss:
             loss_det, tb_dict, disp_dict = self.get_training_loss()
             dev = mfused_last.device
@@ -306,12 +321,13 @@ class TemporalPointPillar(PointPillar):
             tb_dict["loss_total"] = loss_total.detach()
             tb_dict["loss_det"] = loss_det.detach() if loss_det is not None else torch.zeros((), device=dev)
 
+            # Save debug info
             self.debug_last = {k: (v.detach() if isinstance(v, torch.Tensor) else v) for k, v in dbg_last.items()}
             self.debug_last["mp_last"] = mp_last.detach()
 
             return {"loss": loss_total}, tb_dict, disp_dict, None
 
+        # Inference mode
         frames_list[-1] = self._fill_postproc_inputs(frames_list[-1])
         pred_dicts, recall_dicts = self.post_processing(frames_list[-1])
         return pred_dicts, recall_dicts, None
-    

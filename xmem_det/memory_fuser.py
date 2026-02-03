@@ -3,6 +3,10 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from typing import Any, Dict, List
+
+import torch
+
 
 class ReasonNetValueEnc(nn.Module):
     """
@@ -44,7 +48,7 @@ class ReasonNetTemporalBank(nn.Module):
         c_bev: int,
         key_dim: int = 64,
 
-        ts: int = 4,
+        ts: int = 2,
         tl: int = 2,
         tau: int = 2,
 
@@ -88,6 +92,8 @@ class ReasonNetTemporalBank(nn.Module):
             num_layers=1,
             batch_first=True
         )
+
+        self.gru_output_norm = nn.LayerNorm(c_bev)
 
         self.value_enc = ReasonNetValueEnc(self.c_bev, mp_ch=7, hidden=256)
 
@@ -362,6 +368,7 @@ class ReasonNetTemporalBank(nn.Module):
         if self._gru_h is not None:
             self._gru_h = self._gru_h.detach()
         out_seq, h_new = self.gru(m_seq, self._gru_h)
+        
         self._gru_h = h_new.detach()
 
         mfused_t = out_seq[:, -1, :].reshape(b, h, w, self.c_bev).permute(0, 3, 1, 2)  # [B, C, H, W]
@@ -371,11 +378,12 @@ class ReasonNetTemporalBank(nn.Module):
 
         dbg = {
             "q_t": q_t,
-            "m_t": m_t_debug,
-            "attn_t": attn_t,
             "mfused_t": mfused_t,
+            "m_frames": m_frames,
+            "mem_kinds": mem_kinds,
         }
         return mfused_t, dbg
+
 
     def update_bank(self, q_t: torch.Tensor, mfused_t: torch.Tensor, mp_t: torch.Tensor) -> torch.Tensor:
         """
@@ -414,3 +422,24 @@ class ReasonNetTemporalBank(nn.Module):
             self._st_usage.pop(0)
 
         return v_t
+
+    def get_debug_state(self) -> Dict[str, Any]:
+        lt_tokens = int(sum(self._lt_fill)) if len(self._lt_fill) > 0 else 0
+        return {
+            "step": int(self._step),
+            "st_len": int(len(self._st_keys)),
+            "lt_len": int(len(self._lt_keys)),
+            "lt_tokens": lt_tokens,
+            "lt_fills": [int(x) for x in self._lt_fill],
+            "did_write": int(1 if (self.tau <= 1 or (self._step % self.tau) == 0) else 0),
+        }
+
+
+    def get_debug_maps(self, batch_idx: int = 0) -> Dict[str, List[torch.Tensor]]:
+        st_usage = []
+        st_mp0 = []
+        for u in self._st_usage:
+            st_usage.append(u[batch_idx].detach())
+        for m in self._st_mp0:
+            st_mp0.append(m[batch_idx, 0].detach())
+        return {"st_usage": st_usage, "st_mp0": st_mp0}
