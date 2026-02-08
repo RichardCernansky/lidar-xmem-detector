@@ -9,8 +9,8 @@ TEST:
 
 ADDONS:
   RUN:
-    PHASE: "0"
-    DEVICE: "cpu"
+    PHASE: "1"
+    DEVICE: "cuda"
 
     LOG_DIR: "log"
     LOG_FILE_TEMPLATE: "train_temporal_pp_{tag}.txt"
@@ -23,10 +23,10 @@ ADDONS:
     CKPT_DIR: "log/ckpt"
 
     # either one of RESUME_CKPT and PRETRAINED_PP_CKPT can be set to non-null
-    # RESUME_CKPT: "/home/cernanskyr/pp_xmem_det/log/ckpt/phase0_only_seq8_epoch_9.pth"
+    # RESUME_CKPT: "/home/cernanskyr/pp_xmem_det/log/ckpt/phase0_only_seq8_epoch_5.pth"
     RESUME_CKPT: null
     # PRETRAINED_PP_CKPT: null
-    PRETRAINED_PP_CKPT: "/home/cernanskyr/OpenPCDet/output/cfgs/nuscenes_models/cbgs_dyn_pp_centerpoint/dynpp_centerpoint_pretrain/ckpt/checkpoint_epoch_18.pth"
+    PRETRAINED_PP_CKPT: "/home/cernanskyr/OpenPCDet/output/cfgs/nuscenes_models/cbgs_dyn_pp_centerpoint/dynpp_centerpoint_pretrain/ckpt/checkpoint_epoch_20.pth"
 
     USE_CKPT_EPOCH: true
     RESUME_OPTIM_SCHED: false
@@ -56,11 +56,11 @@ ADDONS:
       PREFIXES: ["bank"]
 
       START_EPOCH: 0
-      END_EPOCH: 10
+      END_EPOCH: 5
 
-      LR_START: 3e-5
-      LR_MAX: 3e-5
-      LR_END: 1e-6
+      LR_START: 1.5e-7
+      LR_MAX: 1.5e-7
+      LR_END: 3e-8
       WARMUP_EPOCHS: 0
 
       ALPHA_START: 1.0  
@@ -82,42 +82,34 @@ ADDONS:
           LR_MULT: 0.0
 
       CKPT_NAME_TEMPLATE: "phase{phase}_{tag}_epoch_{epoch}.pth"
-
+  PHASES:
     "1":
-      PREFIXES: ["xmem",  "bev_adapter", "g4_to_bev", "dense_head"] 
+      PREFIXES: ['bank.', 'dense_head.', 'backbone_2d.']
+      START_EPOCH: 0
+      END_EPOCH: 8
 
-      START_EPOCH: 10
-      END_EPOCH: 15
-
-      LR_START: 3e-7
-      LR_MAX: 3e-7
-      LR_END: 1e-8
+      LR_START: 2e-5
+      LR_MAX: 2e-5
+      LR_END: 3e-7
       WARMUP_EPOCHS: 0
 
-      ALPHA_START: 1.0
-      ALPHA_END: 1.6
-      ALPHA_RAMP_EPOCHS: 4
+      ALPHA_START: 1.0  
+      ALPHA_END: 1.0
+      ALPHA_RAMP_EPOCHS: 5
 
       PROB_SCHEDULE:
         TEACHER:
-          START: 0.0 
-          END: 0.0
-          RAMP_EPOCHS: 5
-
+          START: 1.0
+          END: 1.0
+          RAMP_EPOCHS: 1
+      
       OPT_GROUP_SPECS:
-        - PREFIXES: ["xmem"]
-          LR_MULT: 0.6
-        - PREFIXES: ["readout_to_bev"]
+        - PREFIXES: ['bank.']
           LR_MULT: 1.0
-        - PREFIXES: ["dense_head"]
-          LR_MULT: 1.0
-        - PREFIXES: ["readout_gru"]
-          LR_MULT: 1.0
-        - PREFIXES: ["backbone_2d"]
-          LR_MULT: 0.0
-        - PREFIXES: ["bev_adapter"]
-          LR_MULT: 0.6
-
+        - PREFIXES: ['dense_head.']
+          LR_MULT: 0.5  # Let head adapt
+        - PREFIXES: ['backbone_2d.']
+          LR_MULT: 0.1
 
       CKPT_NAME_TEMPLATE: "phase{phase}_{tag}_epoch_{epoch}.pth"
 

@@ -127,6 +127,118 @@ class TemporalPointPillar(PointPillar):
         out[:, :C] = bev
         return out
 
+    def _create_mp_from_gt(self, batch_dict: dict) -> torch.Tensor:
+        """
+        Create Mp_t [B, 7, H, W] from ground truth boxes using CenterPoint's target assignment.
+        This works even with a random head since assign_targets has no learned parameters!
+        """
+        # Get spatial dimensions
+        spatial_features = batch_dict['spatial_features_2d']
+        B, C, H, W = spatial_features.shape
+        device = spatial_features.device
+        dtype = spatial_features.dtype
+        
+        # Call CenterPoint's target assignment (no learned parameters!)
+        with torch.no_grad():
+            target_dict = self.dense_head.assign_targets(
+                gt_boxes=batch_dict['gt_boxes'],
+                feature_map_size=(H, W),  # Pass as tuple
+                feature_map_stride=batch_dict.get('spatial_features_2d_strides', None)
+            )
+        
+        # target_dict contains:
+        # 'heatmaps': list of [B, num_classes, H, W] (one per head)
+        # 'target_boxes': list of [B, num_max_objs, K] (one per head)
+        # 'inds': list of [B, num_max_objs] (linear indices)
+        # 'masks': list of [B, num_max_objs] (which objects are valid)
+        
+        # We need to convert from sparse (object-indexed) to dense (spatial) format
+        mp_t = self._convert_target_dict_to_mp(target_dict, B, H, W, device, dtype)
+        
+        return mp_t
+
+
+    def _convert_target_dict_to_mp(
+        self, 
+        target_dict: dict, 
+        B: int, 
+        H: int, 
+        W: int, 
+        device: torch.device,
+        dtype: torch.dtype
+    ) -> torch.Tensor:
+        """
+        Convert CenterPoint's target_dict (sparse format) to Mp_t (dense format).
+        
+        CenterPoint stores targets sparsely:
+        - heatmaps: [B, num_classes, H, W] (dense, Gaussian)
+        - target_boxes: [B, num_max_objs, K] (sparse, only at object centers)
+        - inds: [B, num_max_objs] (linear indices where objects are)
+        - masks: [B, num_max_objs] (which indices are valid)
+        
+        We need to scatter target_boxes to [B, 7, H, W] spatial format.
+        """
+        mp_t = torch.zeros(B, 7, H, W, device=device, dtype=dtype)
+        
+        # Aggregate over all heads (CenterPoint can have multiple heads for different classes)
+        num_heads = len(target_dict['heatmaps'])
+        
+        for head_idx in range(num_heads):
+            heatmap = target_dict['heatmaps'][head_idx]  # [B, num_cls, H, W]
+            target_boxes = target_dict['target_boxes'][head_idx]  # [B, num_max_objs, K]
+            inds = target_dict['inds'][head_idx]  # [B, num_max_objs]
+            masks = target_dict['masks'][head_idx]  # [B, num_max_objs]
+            
+            # Channel 0: Existence (max over all classes)
+            heatmap_max = heatmap.max(dim=1, keepdim=True)[0]  # [B, 1, H, W]
+            mp_t[:, 0:1] = torch.max(mp_t[:, 0:1], heatmap_max)
+            
+            # Channels 1-6: Scatter target_boxes to spatial locations
+            for b in range(B):
+                for obj_idx in range(target_boxes.shape[1]):
+                    if masks[b, obj_idx] == 0:
+                        continue  # Skip invalid objects
+                    
+                    # Get linear index and convert to (y, x)
+                    linear_idx = inds[b, obj_idx].long()
+                    y = linear_idx // W
+                    x = linear_idx % W
+                    
+                    # target_boxes format (from assign_target_of_single_head):
+                    # [0:2]: center offset (x, y)
+                    # [2]: z
+                    # [3:6]: log(w, l, h)
+                    # [6]: cos(heading)
+                    # [7]: sin(heading)
+                    # [8:]: velocity (if present)
+                    
+                    box = target_boxes[b, obj_idx]
+                    
+                    # Only update if this location has higher existence
+                    if heatmap_max[b, 0, y, x] > mp_t[b, 0, y, x]:
+                        # Channels 1-2: XY offset
+                        mp_t[b, 1, y, x] = box[0]  # x offset
+                        mp_t[b, 2, y, x] = box[1]  # y offset
+                        
+                        # Channels 3-4: Dimensions (convert from log space)
+                        mp_t[b, 3, y, x] = box[4].exp()  # width (log(w) -> w)
+                        mp_t[b, 4, y, x] = box[3].exp()  # length (log(l) -> l)
+                        
+                        # Channel 5: Heading (convert cos/sin to angle)
+                        cos_h = box[6]
+                        sin_h = box[7]
+                        mp_t[b, 5, y, x] = torch.atan2(sin_h, cos_h)
+                        
+                        # Channel 6: Velocity magnitude
+                        if box.shape[0] > 8:  # Has velocity
+                            vx = box[8]
+                            vy = box[9] if box.shape[0] > 9 else 0.0
+                            mp_t[b, 6, y, x] = torch.sqrt(vx**2 + vy**2 + 1e-8)
+                        else:
+                            mp_t[b, 6, y, x] = 0.0
+        
+        return mp_t
+
     def _extract_mp_from_centerpoint(self, pred_dict: dict, H: int, W: int) -> torch.Tensor:
         """
         Extract 7-channel Mp_t from CenterPoint predictions.
@@ -260,7 +372,7 @@ class TemporalPointPillar(PointPillar):
         mp_last = None
 
         # Optional visualization
-        do_viz = self.training and (self.vis_counter < 5)
+        do_viz = self.training and (self.vis_counter % 50 == 0)
         debugger = None
         if do_viz:
             debugger = TemporalDebugger(
@@ -277,8 +389,16 @@ class TemporalPointPillar(PointPillar):
             # Compute temporally-fused features
             mfused_t, dbg_t = self.bank.compute_mfused(bev_t)
             
-            # Generate Mp_t from CenterPoint predictions (no gradient)
-            mp_t = self._get_mp_from_head_nograd(frames_list[t], mfused_t)
+            # ===== KEY CHANGE: Use GT for Mp_t during training ===== 
+            if self.training:
+                # Use ground truth for Mp_t
+                mp_t = self._create_mp_from_gt(frames_list[t])
+                
+    
+            else:
+                # Use predictions for Mp_t (inference)
+                mp_t = self._get_mp_from_head_nograd(frames_list[t], mfused_t)
+            # =======================================================
             
             # Update memory bank
             self.bank.update_bank(dbg_t["q_t"], mfused_t, mp_t)
@@ -306,7 +426,7 @@ class TemporalPointPillar(PointPillar):
 
         if do_viz:
             debugger.finish_sequence()
-            self.vis_counter += 1
+        self.vis_counter += 1
 
         # Step 3: Detection on last frame only
         frames_list[-1]["spatial_features_2d"] = mfused_last
@@ -327,7 +447,7 @@ class TemporalPointPillar(PointPillar):
 
             return {"loss": loss_total}, tb_dict, disp_dict, None
 
-        # Inference mode
-        frames_list[-1] = self._fill_postproc_inputs(frames_list[-1])
-        pred_dicts, recall_dicts = self.post_processing(frames_list[-1])
-        return pred_dicts, recall_dicts, None
+        final_box = frames_list[-1].get("final_box_dicts", None)
+        if final_box is None:
+            raise KeyError(f"final_box_dicts missing. keys={list(frames_list[-1].keys())}")
+        return final_box, {}, None

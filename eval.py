@@ -12,37 +12,9 @@ from pcdet.datasets import build_dataloader
 from pcdet.utils import common_utils
 
 from xmem_det.temporal_pp import TemporalPointPillar
-from xmem_det.util import load_xmem_train_cfg
-
-
-def deduce_alpha_from_ckpt_if_possible(blob: dict, fallback: float) -> float:
-    if not isinstance(blob, dict):
-        return float(fallback)
-
-    epoch_1based = int(blob.get("epoch", 0))
-    phase1_cfg = blob.get("phase1_cfg", None)
-
-    if epoch_1based <= 0 or not isinstance(phase1_cfg, dict):
-        return float(fallback)
-
-    s = float(phase1_cfg.get("alpha_start", fallback))
-    e = float(phase1_cfg.get("alpha_end", fallback))
-    r = int(phase1_cfg.get("alpha_ramp_epochs", 0))
-
-    if r <= 0:
-        return float(e)
-
-    epoch_idx = max(epoch_1based - 1, 0)
-    if epoch_idx >= r:
-        return float(e)
-
-    x = (epoch_idx + 1) / r
-    return float(s + (e - s) * x)
 
 
 def to_torch_batch_dict(frame_dict, device):
-    # Converts OpenPCDet batch dict values into torch tensors on GPU when appropriate.
-    # Keeps strings/objects as-is (OpenPCDet stores tokens, frame ids, etc. as object arrays).
     batch_dict = {}
     for k, v in frame_dict.items():
         if isinstance(v, np.ndarray):
@@ -54,8 +26,6 @@ def to_torch_batch_dict(frame_dict, device):
             batch_dict[k] = v.to(device, non_blocking=True)
         else:
             batch_dict[k] = v
-
-    # OpenPCDet modules assume batch_size exists in batch_dict. We run batch_size=1 always.
     if "batch_size" not in batch_dict:
         batch_dict["batch_size"] = 1
     return batch_dict
@@ -71,9 +41,6 @@ def fmt_hms(seconds: float) -> str:
 
 
 def steps_for_scene(n: int, seq_len: int) -> int:
-    # Counts how many forward steps total the rolling-window evaluation will do for progress/ETA.
-    # For each frame position pos in the scene, we run a window of length <= seq_len ending at pos.
-    # Total steps is sum of window lengths across all pos.
     n = int(n)
     L = int(seq_len)
     if n <= 0:
@@ -83,38 +50,49 @@ def steps_for_scene(n: int, seq_len: int) -> int:
     return (L * (L + 1) // 2) + (n - L) * L
 
 
+def infer_nusc_dataroot(data_path: str, version: str) -> str:
+    p = Path(str(data_path))
+    v = str(version)
+    if (p / v).exists():
+        return str(p)
+    if p.name == v and (p.parent / v).exists():
+        return str(p.parent)
+    if (p / "samples").exists() or (p / "sweeps").exists():
+        return str(p)
+    return str(p)
+
+
+def token_to_scene_token(nusc: NuScenes, tok: str) -> str:
+    try:
+        return nusc.get("sample", tok)["scene_token"]
+    except Exception:
+        sd = nusc.get("sample_data", tok)
+        sample_tok = sd["sample_token"]
+        return nusc.get("sample", sample_tok)["scene_token"]
+
+
 def parse_args():
     p = argparse.ArgumentParser()
-
     p.add_argument("--cfg_file", type=str, required=True)
-    p.add_argument("--xmem_cfg", type=str, required=True)
     p.add_argument("--ckpt", type=str, required=True)
-
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--split", type=str, default=None)
-    p.add_argument("--alpha", type=float, default=1.0)
-
-    p.add_argument("--seq_len", type=int, default=8)
-
+    p.add_argument("--seq_len", type=int, default=None)
     p.add_argument("--extra_tag", type=str, default="default")
-    p.add_argument("--eval_tag", type=str, default="opt1_window_ends_each_frame")
-    p.add_argument("--log_interval", type=int, default=100)
-
+    p.add_argument("--eval_tag", type=str, default="temporal_eval")
+    p.add_argument("--log_interval", type=int, default=50)
     p.add_argument("--set", dest="set_cfgs", default=None, nargs=argparse.REMAINDER)
-
     args = p.parse_args()
 
-    # Loads the OpenPCDet YAML config into global cfg.
     cfg_from_yaml_file(args.cfg_file, cfg)
-
-    # Optional: allow overriding cfg keys from CLI (OpenPCDet convention).
     if args.set_cfgs is not None:
         cfg_from_list(args.set_cfgs, cfg)
 
-    # This is important: OpenPCDet uses DATA_SPLIT['test'] when building evaluation dataset.
-    # Setting --split ensures you evaluate exactly val or test as intended.
     if args.split is not None:
         cfg.DATA_CONFIG.DATA_SPLIT["test"] = args.split
+
+    if args.seq_len is None:
+        args.seq_len = int(getattr(cfg.TRAIN, "SEQ_LEN", 4))
 
     cfg.TAG = Path(args.cfg_file).stem
     cfg.EXP_GROUP_PATH = "/".join(args.cfg_file.split("/")[1:-1])
@@ -127,7 +105,6 @@ def main():
 
     root_dir = getattr(cfg, "ROOT_DIR", Path.cwd())
 
-    # OpenPCDet-style output folder; eval results go into eval_temporal/<eval_tag>/.
     output_dir = Path(root_dir) / "output" / cfg.EXP_GROUP_PATH / cfg.TAG / args.extra_tag
     eval_output_dir = output_dir / "eval_temporal" / args.eval_tag
     eval_output_dir.mkdir(parents=True, exist_ok=True)
@@ -142,9 +119,6 @@ def main():
     logger.info(f"seq_len={args.seq_len}")
     log_config_to_file(cfg, logger=logger)
 
-    # Build NuScenesDataset in evaluation mode.
-    # Even though build_dataloader returns a DataLoader, we will not iterate it;
-    # we use test_set.__getitem__ directly so we can control temporal grouping and rolling windows.
     test_set, _, _ = build_dataloader(
         dataset_cfg=cfg.DATA_CONFIG,
         class_names=cfg.CLASS_NAMES,
@@ -160,13 +134,13 @@ def main():
     dataroot_for_nusc = Path(cfg.DATA_CONFIG.DATA_PATH) / cfg.DATA_CONFIG.VERSION
     nusc = NuScenes(version=cfg.DATA_CONFIG.VERSION, dataroot=str(dataroot_for_nusc), verbose=False)
 
-    # Group dataset indices by scene, and sort by timestamp so window order matches time.
+
     by_scene = {}
     for i, info in enumerate(test_set.infos):
         tok = info.get("token", None)
         if tok is None:
             raise KeyError("token missing in infos")
-        scene_token = nusc.get("sample", tok)["scene_token"]
+        scene_token = token_to_scene_token(nusc, tok)
         by_scene.setdefault(scene_token, []).append(i)
 
     for scene_token, idxs in by_scene.items():
@@ -174,86 +148,67 @@ def main():
 
     total_samples = len(test_set)
 
-    # Total forward steps is larger than total_samples because rolling window replays past frames.
     total_steps = 0
     for _, idxs in by_scene.items():
         total_steps += steps_for_scene(len(idxs), int(args.seq_len))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Build your temporal detector. It contains XMem + fusion logic internally.
-    xmem_train_cfg = load_xmem_train_cfg(args.xmem_cfg)
     model = TemporalPointPillar(
         model_cfg=cfg.MODEL,
         num_class=len(cfg.CLASS_NAMES),
         dataset=test_set,
-        xmem_train_cfg=xmem_train_cfg,
         pc_range=cfg.DATA_CONFIG.POINT_CLOUD_RANGE,
     ).to(device)
 
-    # Load your checkpoint. If training saved {"model_state": ...}, we load that.
     blob = torch.load(args.ckpt, map_location="cpu")
-    alpha_used = deduce_alpha_from_ckpt_if_possible(blob if isinstance(blob, dict) else {}, float(args.alpha))
-    logger.info(f"alpha={alpha_used}")
-
     state = blob["model_state"] if isinstance(blob, dict) and "model_state" in blob else blob
-    model.load_state_dict(state, strict=True)
-    model.eval()
+    missing, unexpected = model.load_state_dict(state, strict=False)
 
-    # We must generate ONE prediction per dataset frame.
-    # det_annos[i] is the OpenPCDet-format dict for sample i, which OpenPCDet will serialize to NuScenes JSON.
+    if missing:
+        logger.warning(f"Missing keys: {missing}")
+    if unexpected:
+        logger.warning(f"Unexpected keys: {unexpected}")
+
+    model.eval()
+    logger.info("Model loaded and set to eval mode")
+
     det_annos = [None] * total_samples
 
     done_samples = 0
     done_steps = 0
     start_t = time.time()
 
-    # Rolling-window evaluation:
-    # For each frame position 'pos' in a scene:
-    #   window = last up to seq_len frames ending at pos
-    #   run temporal model across that window
-    #   store prediction for the LAST frame only (the frame at pos)
     with torch.no_grad():
         win_id = 0
-        for scene_token, idxs in by_scene.items():
+        scene_items = list(by_scene.items())
+        for scene_idx, (scene_token, idxs) in enumerate(scene_items):
             n = len(idxs)
+            logger.info(f"Processing scene {scene_idx+1}/{len(scene_items)}: {scene_token} ({n} frames)")
 
             for pos in range(n):
                 cur_idx = idxs[pos]
-
-                # Build the window ending at current frame.
                 w_start = max(0, pos - int(args.seq_len) + 1)
                 window = idxs[w_start:pos + 1]
 
-                # Reset temporal state for determinism: each evaluated frame uses only its own past context window.
-                # win_id is just a unique identifier; your model may ignore it.
-                model.reset_sequence(win_id)
+                if hasattr(model, "reset_sequence"):
+                    model.reset_sequence(win_id)
 
-                frames_gpu = []
-                last_batch_cpu = None
-
-                # Collect all frames in the window as OpenPCDet batch_dicts on GPU.
-                # We keep last_batch_cpu because OpenPCDet generate_prediction_dicts expects CPU batch_dict
-                # corresponding to the frame that pred_dicts refer to (the LAST frame in the window).
+                frames_list = []
                 for idx in window:
                     item = test_set.__getitem__(idx)
                     batch_cpu = test_set.collate_batch([item])
                     batch_gpu = to_torch_batch_dict(batch_cpu, device)
-                    frames_gpu.append(batch_gpu)
-                    last_batch_cpu = batch_cpu
+                    frames_list.append(batch_gpu)
 
-                # This is the key call:
-                # forward_eval() should run your XMem inference core across frames_gpu in time order,
-                # extract g4 from segmentation for the last timestep, fuse into BEV, then run dense_head.
-                # Returned pred_dicts must be OpenPCDet-style predictions for the last frame only.
-                pred_dicts, recall_dicts, det_masks_next = model.forward_eval(
-                    frames_gpu,
-                    alpha_temporal=float(alpha_used),
-                    use_det_t0=True,
+                last_item = test_set.__getitem__(cur_idx)
+                last_batch_cpu = test_set.collate_batch([last_item])
+
+                pred_dicts, recall_dicts, _ = model(
+                    frames_list=frames_list,
+                    compute_det_loss=False
                 )
 
-                # Convert OpenPCDet pred_dicts to NuScenes JSON-compatible format.
-                # This produces a list (batch size = 1), so we take [0].
                 annos = test_set.generate_prediction_dicts(
                     batch_dict=last_batch_cpu,
                     pred_dicts=pred_dicts,
@@ -266,7 +221,6 @@ def main():
                 done_steps += len(window)
                 win_id += 1
 
-                # Progress logging uses done_steps because that is the true workload for rolling windows.
                 if done_samples % int(args.log_interval) == 0:
                     now = time.time()
                     elapsed = now - start_t
@@ -275,18 +229,17 @@ def main():
                     pct_t = 100.0 * done_steps / max(total_steps, 1)
                     eta = (total_steps - done_steps) / max(rate, 1e-9)
                     logger.info(
-                        f"Eval progress: samples {pct_s:6.2f}% ({done_samples}/{total_samples}) "
+                        f"Eval: samples {pct_s:6.2f}% ({done_samples}/{total_samples}) "
                         f"steps {pct_t:6.2f}% ({done_steps}/{total_steps}) "
                         f"elapsed={fmt_hms(elapsed)} eta={fmt_hms(eta)} rate={rate:.2f} it/s"
                     )
 
-    # Safety: ensure every frame got a prediction.
-    missing = [i for i, a in enumerate(det_annos) if a is None]
-    if missing:
-        raise RuntimeError(f"Missing predictions for {len(missing)} samples, first missing index={missing[0]}")
+    missing_idxs = [i for i, a in enumerate(det_annos) if a is None]
+    if missing_idxs:
+        raise RuntimeError(f"Missing predictions for {len(missing_idxs)} samples, first missing index={missing_idxs[0]}")
 
-    # NuScenes evaluation sometimes crashes if the FIRST sample has zero predicted boxes.
-    # Workaround: rotate list so first entry is non-empty. This does not change the content, only order.
+    logger.info("All predictions generated successfully")
+
     first_nonempty = -1
     for i, a in enumerate(det_annos):
         names = a.get("name", [])
@@ -296,12 +249,10 @@ def main():
 
     det_annos_eval = det_annos
     if first_nonempty > 0:
-        det_annos_eval = [det_annos[first_nonempty]] + det_annos[:first_nonempty] + det_annos[first_nonempty + 1 :]
+        logger.info(f"Rotating predictions list (first non-empty at index {first_nonempty})")
+        det_annos_eval = [det_annos[first_nonempty]] + det_annos[:first_nonempty] + det_annos[first_nonempty + 1:]
 
-    # OpenPCDet runs official NuScenes detection eval here:
-    # - dumps results JSON
-    # - runs NuScenes evaluator
-    # - returns metric string + dict (NDS, mAP, per-class metrics)
+    logger.info("Running evaluation...")
     eval_metric = getattr(cfg.MODEL.POST_PROCESSING, "EVAL_METRIC", "nuscenes")
     result_str, result_dict = test_set.evaluation(
         det_annos=det_annos_eval,
@@ -310,9 +261,15 @@ def main():
         output_path=str(eval_output_dir),
     )
 
+    logger.info("\n" + "=" * 80)
+    logger.info("EVALUATION RESULTS")
+    logger.info("=" * 80)
     logger.info(result_str)
-    logger.info(str(result_dict))
-    print(result_str)
+    logger.info("=" * 80)
+    logger.info(f"Results dict: {result_dict}")
+    logger.info("=" * 80 + "\n")
+
+    print("\n" + result_str)
 
 
 if __name__ == "__main__":

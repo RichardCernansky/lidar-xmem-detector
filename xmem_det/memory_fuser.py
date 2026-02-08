@@ -48,7 +48,7 @@ class ReasonNetTemporalBank(nn.Module):
         c_bev: int,
         key_dim: int = 64,
 
-        ts: int = 2,
+        ts: int = 4,
         tl: int = 2,
         tau: int = 2,
 

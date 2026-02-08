@@ -448,17 +448,22 @@ def main():
         model.load_state_dict(resume_blob["model_state"], strict=False)
         logger.info(f"Resumed model from {resume_ckpt} at epoch {int(resume_blob.get('epoch', 0))}")
     elif pretrained_pp_ckpt is not None:
+        # ckpt = torch.load(str(pretrained_pp_ckpt), map_location="cpu")
+        # state = ckpt["model_state"] if "model_state" in ckpt else ckpt
+        # model.load_state_dict(state, strict=False)
+        # logger.info(f"Loaded pretrained PP from {pretrained_pp_ckpt}")
+    
         ckpt = torch.load(str(pretrained_pp_ckpt), map_location="cpu")
         state = ckpt["model_state"] if "model_state" in ckpt else ckpt
-        model.load_state_dict(state, strict=False)
-        logger.info(f"Loaded pretrained PP from {pretrained_pp_ckpt}")
-    # ckpt_path = "log/ckpt/phase1_only_seq8_epoch_9.pth"
-    # ckpt = torch.load(ckpt_path, map_location="cpu")
-    # state = ckpt.get("model_state", ckpt)
-    # print(state.keys())
-    # prefix = "xmem."
-    # xmem_state = {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
-    # model.xmem.load_state_dict(xmem_state, strict=True)
+        
+        # Filter out dense_head
+        backbone_state = {k: v for k, v in state.items() if not k.startswith('dense_head.')}
+        skipped = len(state) - len(backbone_state)
+        
+        missing, unexpected = model.load_state_dict(backbone_state, strict=False)
+        logger.info(f"✅ Loaded backbone only from {pretrained_pp_ckpt}")
+        logger.info(f"⏭️  Skipped {skipped} dense_head parameters (will be random)")
+        logger.info(f"🎲 Missing (random): {len(missing)} parameters")
 
 
     # check required config keys
