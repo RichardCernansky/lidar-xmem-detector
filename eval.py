@@ -12,6 +12,7 @@ from pcdet.datasets import build_dataloader
 from pcdet.utils import common_utils
 
 from xmem_det.temporal_pp import TemporalPointPillar
+from xmem_det.lstm_vis import TemporalDebugger  # NEW!
 
 
 def to_torch_batch_dict(frame_dict, device):
@@ -71,6 +72,12 @@ def token_to_scene_token(nusc: NuScenes, tok: str) -> str:
         return nusc.get("sample", sample_tok)["scene_token"]
 
 
+
+
+
+# ... [keep all your existing helper functions] ...
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--cfg_file", type=str, required=True)
@@ -81,6 +88,12 @@ def parse_args():
     p.add_argument("--extra_tag", type=str, default="default")
     p.add_argument("--eval_tag", type=str, default="temporal_eval")
     p.add_argument("--log_interval", type=int, default=50)
+    
+    # NEW: Visualization options
+    p.add_argument("--visualize", action="store_true", help="Enable visualization")
+    p.add_argument("--vis_scenes", type=int, default=3, help="Number of scenes to visualize")
+    p.add_argument("--vis_interval", type=int, default=1, help="Visualize every N frames")
+    
     p.add_argument("--set", dest="set_cfgs", default=None, nargs=argparse.REMAINDER)
     args = p.parse_args()
 
@@ -117,6 +130,9 @@ def main():
     logger.info(f"ckpt={args.ckpt}")
     logger.info(f"split={cfg.DATA_CONFIG.DATA_SPLIT['test']}")
     logger.info(f"seq_len={args.seq_len}")
+    logger.info(f"visualize={args.visualize}")
+    if args.visualize:
+        logger.info(f"vis_scenes={args.vis_scenes}, vis_interval={args.vis_interval}")
     log_config_to_file(cfg, logger=logger)
 
     test_set, _, _ = build_dataloader(
@@ -129,11 +145,8 @@ def main():
         training=False,
     )
 
-    # NuScenes API is used ONLY to map each sample token -> scene_token,
-    # so we can evaluate sequences in correct temporal order.
     dataroot_for_nusc = Path(cfg.DATA_CONFIG.DATA_PATH) / cfg.DATA_CONFIG.VERSION
     nusc = NuScenes(version=cfg.DATA_CONFIG.VERSION, dataroot=str(dataroot_for_nusc), verbose=False)
-
 
     by_scene = {}
     for i, info in enumerate(test_set.infos):
@@ -173,6 +186,19 @@ def main():
     model.eval()
     logger.info("Model loaded and set to eval mode")
 
+    # NEW: Setup visualization
+    if args.visualize:
+        vis_dir = "visualizations"
+        debugger = TemporalDebugger(
+            save_dir=str(vis_dir),
+            log_every=args.vis_interval,
+            max_batches=1
+        )
+        model.debugger = debugger  # Attach to model
+        logger.info(f"Visualization enabled, saving to {vis_dir}")
+    else:
+        debugger = None
+
     det_annos = [None] * total_samples
 
     done_samples = 0
@@ -185,6 +211,12 @@ def main():
         for scene_idx, (scene_token, idxs) in enumerate(scene_items):
             n = len(idxs)
             logger.info(f"Processing scene {scene_idx+1}/{len(scene_items)}: {scene_token} ({n} frames)")
+
+            # NEW: Start visualization for this scene
+            visualize_this_scene = args.visualize and scene_idx < args.vis_scenes
+            if visualize_this_scene:
+                debugger.start_sequence(f"scene_{scene_idx:03d}_{scene_token[:8]}")
+                logger.info(f"  → Visualizing this scene")
 
             for pos in range(n):
                 cur_idx = idxs[pos]
@@ -204,9 +236,11 @@ def main():
                 last_item = test_set.__getitem__(cur_idx)
                 last_batch_cpu = test_set.collate_batch([last_item])
 
-                pred_dicts, recall_dicts, _ = model(
+                # Run model (debugger logs internally if attached)
+                pred_dicts, recall_dicts, debug_info = model(
                     frames_list=frames_list,
-                    compute_det_loss=False
+                    compute_det_loss=False,
+                    return_debug_info=False  # Debug info logged internally via debugger
                 )
 
                 annos = test_set.generate_prediction_dicts(
@@ -233,6 +267,12 @@ def main():
                         f"steps {pct_t:6.2f}% ({done_steps}/{total_steps}) "
                         f"elapsed={fmt_hms(elapsed)} eta={fmt_hms(eta)} rate={rate:.2f} it/s"
                     )
+
+            # NEW: Finish visualization for this scene
+            if visualize_this_scene:
+                debugger.finish_sequence()
+
+    # ... [rest of your evaluation code stays exactly the same] ...
 
     missing_idxs = [i for i, a in enumerate(det_annos) if a is None]
     if missing_idxs:
