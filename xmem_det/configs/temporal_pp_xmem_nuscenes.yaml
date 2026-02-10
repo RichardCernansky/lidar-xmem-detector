@@ -23,11 +23,11 @@ ADDONS:
     CKPT_DIR: "log/ckpt"
 
     # either one of RESUME_CKPT and PRETRAINED_PP_CKPT can be set to non-null
-    # RESUME_CKPT: "/home/cernanskyr/pp_xmem_det/log/ckpt/phase0_only_seq8_epoch_5.pth"
+    # RESUME_CKPT: "/home/cernanskyr/pp_xmem_det/log/ckpt/phase0_only_seq8_epoch_2.pth"
     RESUME_CKPT: null
     # PRETRAINED_PP_CKPT: null
     PRETRAINED_PP_CKPT: "/home/cernanskyr/OpenPCDet/output/cfgs/nuscenes_models/cbgs_dyn_pp_centerpoint/dynpp_centerpoint_pretrain/ckpt/checkpoint_epoch_20.pth"
-
+# 
     USE_CKPT_EPOCH: true
     RESUME_OPTIM_SCHED: false
 
@@ -52,20 +52,20 @@ ADDONS:
 
   PHASES:
     "0":
-      # PREFIXES: ["xmem", "bev_adapter"]
-      PREFIXES: ['conv_lstm', 'dense_head', 'lstm_proj']
-
+    
+      PREFIXES: ['conv_gru', 'gru_proj', 'feature_adapter', 'fusion_layer', 'backbone_2d', 'dense_head']
+    
       START_EPOCH: 0
       END_EPOCH: 6
 
-      LR_START: 2e-5
-      LR_MAX: 2e-5
-      LR_END: 3e-8
+      LR_START: 1e-4
+      LR_MAX: 1e-4
+      LR_END: 1e-5
       WARMUP_EPOCHS: 0
 
-      ALPHA_START: 1.0  
-      ALPHA_END: 1.0
-      ALPHA_RAMP_EPOCHS: 5
+      ALPHA_START: 0
+      ALPHA_END: 0.5
+      ALPHA_RAMP_EPOCHS: 4
 
       PROB_SCHEDULE:
         TEACHER:
@@ -74,14 +74,22 @@ ADDONS:
           RAMP_EPOCHS: 1
 
       OPT_GROUP_SPECS:
-        - PREFIXES: ["dense_head"]
-          LR_MULT: 
-        - PREFIXES: ['conv_lstm']
-          LR_MULT: 1.0
-        - PREFIXES: ['lstm_proj']
-          LR_MULT: 1.0
+        - PREFIXES: ["vfe"]
+          LR_MULT: 0.0      # FROZEN
+        - PREFIXES: ["backbone_2d.blocks.0", "backbone_2d.blocks.1"]
+          LR_MULT: 0.0      # FROZEN (early backbone)
         - PREFIXES: ["backbone_2d"]
-          LR_MULT: 0.0
+          LR_MULT: 0.1      # Late backbone: low LR
+        - PREFIXES: ["dense_head"]
+          LR_MULT: 0.01     # Head: very low LR (1e-5)
+        - PREFIXES: ["conv_gru"]
+          LR_MULT: 1.0      # GRU: high LR
+        - PREFIXES: ["gru_proj"]
+          LR_MULT: 1.0
+        - PREFIXES: ["feature_adapter"]
+          LR_MULT: 1.0
+        - PREFIXES: ["fusion_layer"]
+          LR_MULT: 1.0
 
       CKPT_NAME_TEMPLATE: "phase{phase}_{tag}_epoch_{epoch}.pth"
 

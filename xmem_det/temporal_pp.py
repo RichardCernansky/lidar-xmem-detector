@@ -2,13 +2,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import contextlib
 
 from pcdet.models.detectors.pointpillar import PointPillar
 
 
-class ConvLSTMCell(nn.Module):
+class ConvGRUCell(nn.Module):
     """
-    Basic ConvLSTM cell for processing spatial features with temporal dynamics.
+    ConvGRU cell (simpler than LSTM, prevents overfitting)
     """
     def __init__(self, input_dim, hidden_dim, kernel_size=3):
         super().__init__()
@@ -16,55 +17,60 @@ class ConvLSTMCell(nn.Module):
         self.hidden_dim = hidden_dim
         
         padding = kernel_size // 2
-        self.conv = nn.Conv2d(
-            in_channels=input_dim + hidden_dim,
-            out_channels=4 * hidden_dim,  # i, f, o, g gates
-            kernel_size=kernel_size,
+        
+        # Combined conv for reset and update gates
+        self.conv_gates = nn.Conv2d(
+            input_dim + hidden_dim,
+            2 * hidden_dim,  # r, z
+            kernel_size,
+            padding=padding,
+            bias=True
+        )
+        
+        # Conv for candidate hidden state
+        self.conv_candidate = nn.Conv2d(
+            input_dim + hidden_dim,
+            hidden_dim,
+            kernel_size,
             padding=padding,
             bias=True
         )
     
-    def forward(self, x, hidden_state):
+    def forward(self, x, h):
         """
         Args:
-            x: [B, C, H, W] - current input
-            hidden_state: tuple of (h, c) each [B, hidden_dim, H, W]
+            x: [B, C, H, W]
+            h: [B, hidden_dim, H, W]
         Returns:
-            new hidden state tuple (h, c)
+            h_next: [B, hidden_dim, H, W]
         """
-        h, c = hidden_state
+        combined = torch.cat([x, h], dim=1)
         
-        # Concatenate input and hidden state
-        combined = torch.cat([x, h], dim=1)  # [B, C + hidden_dim, H, W]
+        # Reset and update gates
+        gates = self.conv_gates(combined)
+        r, z = torch.split(gates, self.hidden_dim, dim=1)
+        r = torch.sigmoid(r)
+        z = torch.sigmoid(z)
         
-        # Compute gates
-        gates = self.conv(combined)  # [B, 4*hidden_dim, H, W]
+        # Candidate hidden state
+        combined_r = torch.cat([x, r * h], dim=1)
+        h_candidate = torch.tanh(self.conv_candidate(combined_r))
         
-        # Split into i, f, o, g
-        i, f, o, g = torch.split(gates, self.hidden_dim, dim=1)
+        # New hidden state
+        h_next = (1 - z) * h + z * h_candidate
         
-        i = torch.sigmoid(i)
-        f = torch.sigmoid(f)
-        o = torch.sigmoid(o)
-        g = torch.tanh(g)
-        
-        # Update cell state and hidden state
-        c_next = f * c + i * g
-        h_next = o * torch.tanh(c_next)
-        
-        return h_next, c_next
+        return h_next
 
 
 class TemporalPointPillar(PointPillar):
     """
-    Simplified temporal PointPillar with ConvLSTM processing.
+    Temporal PointPillar with ConvGRU and feature fusion.
     
-    Flow:
-        1. Extract BEV features from all frames using backbone
-        2. Process through ConvLSTM to aggregate temporal information
-        3. Run detection head on final timestep only
+    Two-stage training:
+        Stage 1: Pretrain single-frame PointPillar
+        Stage 2: Add GRU, freeze early layers, fine-tune
     """
-    def __init__(self, model_cfg, num_class, dataset, pc_range, lstm_hidden_dim: int = 128):
+    def __init__(self, model_cfg, num_class, dataset, pc_range=None, lstm_hidden_dim: int = None):
         super().__init__(model_cfg=model_cfg, num_class=num_class, dataset=dataset)
         
         if pc_range is None:
@@ -74,34 +80,70 @@ class TemporalPointPillar(PointPillar):
         # Get BEV feature dimension from backbone
         self.c_bev = int(self.backbone_2d.num_bev_features)
         
-        # ConvLSTM for temporal processing
-        self.lstm_hidden_dim = int(lstm_hidden_dim)
-        self.conv_lstm = ConvLSTMCell(
+        # Use same dimension as BEV features (no bottleneck)
+        self.lstm_hidden_dim = lstm_hidden_dim if lstm_hidden_dim is not None else self.c_bev
+        
+        # ConvGRU for temporal processing (simpler than LSTM)
+        self.conv_gru = ConvGRUCell(
             input_dim=self.c_bev,
             hidden_dim=self.lstm_hidden_dim,
             kernel_size=3
         )
         
-        # Project LSTM output back to BEV feature dimension for detection head
-        self.lstm_proj = nn.Sequential(
-            nn.Conv2d(self.lstm_hidden_dim, self.c_bev, kernel_size=1),
+        # Project GRU output back to BEV dimension
+        if self.lstm_hidden_dim != self.c_bev:
+            self.gru_proj = nn.Sequential(
+                nn.Conv2d(self.lstm_hidden_dim, self.c_bev, kernel_size=1),
+                nn.BatchNorm2d(self.c_bev),
+                nn.ReLU(inplace=True)
+            )
+        else:
+            self.gru_proj = nn.Identity()
+        
+        # Feature adapter: Match temporal feature distribution to single-frame
+        self.feature_adapter = nn.Sequential(
+            nn.BatchNorm2d(self.c_bev),  # Normalize
+            nn.Conv2d(self.c_bev, self.c_bev, kernel_size=1),  # Learn scale
+        )
+        
+        # Fusion layer: Combine single-frame + temporal
+        self.fusion_layer = nn.Sequential(
+            nn.Conv2d(self.c_bev * 2, self.c_bev, kernel_size=1),
             nn.BatchNorm2d(self.c_bev),
             nn.ReLU(inplace=True)
         )
         
-        # Debugger (optional, set externally)
         self.debugger = None
     
+    def freeze_early_layers(self):
+        """
+        Freeze early layers to prevent distribution drift.
+        Call this AFTER loading pretrained weights!
+        """
+        # Freeze VFE (pillar encoder)
+        if hasattr(self, 'vfe'):
+            print("Freezing VFE (pillar encoder)")
+            for param in self.vfe.parameters():
+                param.requires_grad = False
+        
+        # Freeze early backbone blocks
+        if hasattr(self.backbone_2d, 'blocks'):
+            num_freeze = min(2, len(self.backbone_2d.blocks))
+            print(f"Freezing first {num_freeze} backbone blocks")
+            for block in self.backbone_2d.blocks[:num_freeze]:
+                for param in block.parameters():
+                    param.requires_grad = False
+    
     def reset_sequence(self, seq_id: int):
-        """Reset LSTM hidden state for new sequence"""
-        pass  # Will initialize fresh state in forward()
+        """Reset for new sequence"""
+        pass
     
     def forward(self, frames_list, compute_det_loss: bool = True, return_debug_info: bool = False):
         """
         Args:
             frames_list: List of T frame dictionaries
             compute_det_loss: Whether to compute detection loss
-            return_debug_info: Whether to return debug information for visualization
+            return_debug_info: Whether to return debug information
         
         Returns:
             If training: (loss_dict, tb_dict, disp_dict, debug_info)
@@ -111,87 +153,97 @@ class TemporalPointPillar(PointPillar):
         if T <= 0:
             raise ValueError("frames_list is empty")
         
+        # Randomize warmup length during training (TimePillars strategy)
+        if self.training and T > 1:
+            num_warmup = np.random.randint(max(1, T - 3), T)
+        else:
+            num_warmup = T - 1
+        
         # Step 1: Extract BEV features from all frames
         bev_list = []
         for t in range(T):
             bd = frames_list[t]
-            # Run through all modules except detection head
-            for cur_module in self.module_list:
-                if cur_module is self.dense_head:
-                    break
-                bd = cur_module(bd)
             
-            frames_list[t] = bd  # Save processed batch_dict
+            # Warmup frames: no gradients (except final frame)
+            use_no_grad = (t < T - 1)
+            context = torch.no_grad() if use_no_grad else contextlib.nullcontext()
+            
+            with context:
+                # Run through backbone (not detection head)
+                for cur_module in self.module_list:
+                    if cur_module is self.dense_head:
+                        break
+                    bd = cur_module(bd)
+            
+            frames_list[t] = bd
             bev = bd["spatial_features_2d"]  # [B, C, H, W]
             bev_list.append(bev)
         
-        # Step 2: Process through ConvLSTM
+        # Step 2: Process through ConvGRU
         B, C, H, W = bev_list[0].shape
         device = bev_list[0].device
         
         # Initialize hidden state
         h = torch.zeros(B, self.lstm_hidden_dim, H, W, device=device)
-        c = torch.zeros(B, self.lstm_hidden_dim, H, W, device=device)
         
-        # Process sequence through LSTM
-        for t in range(T):
-            h, c = self.conv_lstm(bev_list[t], (h, c))
-            
-            # Optional: Log intermediate timesteps
-            if self.debugger is not None and t < T - 1:
-                # For intermediate frames, we don't have detections yet
-                self.debugger.log_timestep(
-                    t=t,
-                    bev_single=bev_list[t],
-                    bev_temporal=self.lstm_proj(h),  # Projected for visualization
-                    lstm_hidden=h,
-                    lstm_cell=c,
-                    batch_idx=0,
-                )
+        # Warmup phase (no gradients)
+        with torch.no_grad():
+            for t in range(num_warmup):
+                h = self.conv_gru(bev_list[t], h)
         
-        # Step 3: Project LSTM output to BEV feature space
-        bev_temporal = self.lstm_proj(h)  # [B, c_bev, H, W]
+        # Final frame (with gradients)
+        h = self.conv_gru(bev_list[-1], h)
         
-        # Step 4: Run detection head on final frame
-        frames_list[-1]["spatial_features_2d"] = bev_temporal
+        # Step 3: Project GRU output to BEV dimension
+        bev_temporal = self.gru_proj(h)  # [B, c_bev, H, W]
+        
+        # Step 4: Adapt temporal features to match single-frame distribution
+        bev_temporal = self.feature_adapter(bev_temporal)
+        
+        # Step 5: Fuse single-frame and temporal features
+        bev_single = bev_list[-1]  # Keep gradients!
+        bev_fused = self.fusion_layer(
+            torch.cat([bev_single, bev_temporal], dim=1)
+        )
+        
+        # Debug: Print feature statistics
+        # if self.training and torch.rand(1).item() < 0.01:  # 1% of batches
+        #     print(f"\nFeature stats:")
+        #     print(f"  Single: mean={bev_single.mean():.2f}, std={bev_single.std():.2f}")
+        #     print(f"  Temporal: mean={bev_temporal.mean():.2f}, std={bev_temporal.std():.2f}")
+        #     print(f"  Fused: mean={bev_fused.mean():.2f}, std={bev_fused.std():.2f}")
+        
+        # Step 6: Run detection head
+        frames_list[-1]["spatial_features_2d"] = bev_fused
         frames_list[-1] = self.dense_head(frames_list[-1])
         
-        # Extract predictions for visualization
+        # Extract predictions for debugging
         pred_boxes = None
         pred_scores = None
         pred_labels = None
         
         if return_debug_info or self.debugger is not None:
             final_dict = frames_list[-1]
-            
-            # Extract from batch_cls_preds and batch_box_preds
             if "batch_cls_preds" in final_dict and "batch_box_preds" in final_dict:
-                cls_preds = final_dict["batch_cls_preds"]  # [B, H*W*anchors, num_class]
-                box_preds = final_dict["batch_box_preds"]  # [B, H*W*anchors, 7]
+                cls_preds = final_dict["batch_cls_preds"][0]
+                box_preds = final_dict["batch_box_preds"][0]
                 
-                # Get predictions for first batch element
-                cls_preds_b0 = cls_preds[0]  # [N, num_class]
-                box_preds_b0 = box_preds[0]  # [N, 7]
+                pred_scores, pred_labels = torch.max(torch.sigmoid(cls_preds), dim=1)
+                pred_boxes = box_preds
                 
-                # Get max class scores
-                pred_scores, pred_labels = torch.max(torch.sigmoid(cls_preds_b0), dim=1)
-                pred_boxes = box_preds_b0
-                
-                # Filter by confidence threshold
-                conf_thresh = 0.1
-                mask = pred_scores > conf_thresh
+                mask = pred_scores > 0.1
                 pred_boxes = pred_boxes[mask]
                 pred_scores = pred_scores[mask]
                 pred_labels = pred_labels[mask]
         
-        # Log final timestep with detections
+        # Logging
         if self.debugger is not None:
             self.debugger.log_timestep(
                 t=T-1,
                 bev_single=bev_list[-1],
                 bev_temporal=bev_temporal,
                 lstm_hidden=h,
-                lstm_cell=c,
+                lstm_cell=None,
                 pred_boxes=pred_boxes,
                 pred_scores=pred_scores,
                 pred_labels=pred_labels,
@@ -204,22 +256,21 @@ class TemporalPointPillar(PointPillar):
             debug_info = {
                 'bev_single': bev_list[-1].detach(),
                 'bev_temporal': bev_temporal.detach(),
-                'lstm_hidden': h.detach() if h is not None else None,
-                'lstm_cell': c.detach() if c is not None else None,
+                'bev_fused': bev_fused.detach(),
+                'lstm_hidden': h.detach(),
                 'pred_boxes': pred_boxes,
                 'pred_scores': pred_scores,
                 'pred_labels': pred_labels,
             }
         
-        # Step 5: Compute loss or return predictions
+        # Step 7: Compute loss or return predictions
         if self.training and compute_det_loss:
             loss_det, tb_dict, disp_dict = self.get_training_loss()
             
-            dev = bev_temporal.device
-            loss_total = loss_det if loss_det is not None else torch.zeros((), device=dev)
+            loss_total = loss_det if loss_det is not None else torch.tensor(0.0, device=device)
             
             tb_dict["loss_total"] = loss_total.detach()
-            tb_dict["loss_det"] = loss_det.detach() if loss_det is not None else torch.zeros((), device=dev)
+            tb_dict["loss_det"] = loss_det.detach() if loss_det is not None else torch.tensor(0.0, device=device)
             
             return {"loss": loss_total}, tb_dict, disp_dict, debug_info
         
