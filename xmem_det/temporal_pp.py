@@ -8,9 +8,6 @@ from pcdet.models.detectors.pointpillar import PointPillar
 
 
 class ConvGRUCell(nn.Module):
-    """
-    ConvGRU cell (simpler than LSTM, prevents overfitting)
-    """
     def __init__(self, input_dim, hidden_dim, kernel_size=3):
         super().__init__()
         self.input_dim = input_dim
