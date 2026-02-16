@@ -9,7 +9,7 @@ TEST:
 
 ADDONS:
   RUN:
-    PHASE: "1"
+    PHASE: "0"
     DEVICE: "cuda"
 
     LOG_DIR: "log"
@@ -52,14 +52,13 @@ ADDONS:
 
   PHASES:
     "0":
-      # PREFIXES: ["xmem", "bev_adapter"]
-      PREFIXES: ["bank"]
+      PREFIXES: ["bank", "dense_head"]
 
       START_EPOCH: 0
-      END_EPOCH: 5
+      END_EPOCH: 10 
 
-      LR_START: 1.5e-7
-      LR_MAX: 1.5e-7
+      LR_START: 3e-5
+      LR_MAX: 3e-5
       LR_END: 3e-8
       WARMUP_EPOCHS: 0
 
@@ -75,14 +74,14 @@ ADDONS:
 
       OPT_GROUP_SPECS:
         - PREFIXES: ["dense_head"]
-          LR_MULT: 0.0
+          LR_MULT: 1.0
         - PREFIXES: ["bank"]
           LR_MULT: 1.0
         - PREFIXES: ["backbone_2d"]
           LR_MULT: 0.0
 
       CKPT_NAME_TEMPLATE: "phase{phase}_{tag}_epoch_{epoch}.pth"
-  PHASES:
+
     "1":
       PREFIXES: ['bank.', 'dense_head.', 'backbone_2d.']
       START_EPOCH: 0

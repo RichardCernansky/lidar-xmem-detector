@@ -157,7 +157,6 @@ class TemporalPointPillar(PointPillar):
         
         return mp_t
 
-
     def _convert_target_dict_to_mp(
         self, 
         target_dict: dict, 
@@ -298,7 +297,6 @@ class TemporalPointPillar(PointPillar):
         
         return mp
 
-
     def _get_mp_from_head_nograd(self, batch_dict_in: dict, mfused_t: torch.Tensor) -> torch.Tensor:
         """
         Generate Mp_t: 7-channel BEV map from CenterPoint head.
@@ -390,14 +388,13 @@ class TemporalPointPillar(PointPillar):
             mfused_t, dbg_t = self.bank.compute_mfused(bev_t)
             
             # ===== KEY CHANGE: Use GT for Mp_t during training ===== 
-            if self.training:
-                # Use ground truth for Mp_t
-                mp_t = self._create_mp_from_gt(frames_list[t])
-                
-    
-            else:
+            # if self.training:
+            #     # Use ground truth for Mp_t
+            #     mp_t = self._create_mp_from_gt(frames_list[t])
+            # else:
                 # Use predictions for Mp_t (inference)
-                mp_t = self._get_mp_from_head_nograd(frames_list[t], mfused_t)
+            
+            mp_t = self._get_mp_from_head_nograd(frames_list[t], mfused_t)
             # =======================================================
             
             # Update memory bank
