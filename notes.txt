@@ -49,3 +49,34 @@ python eval.py   --cfg_file xmem_det/configs/temporal_pp_xmem_nuscenes.yaml   --
 
 EVAL XMEM
 python eval_xmem.py --cfg_file xmem_det/configs/temporal_pp_xmem_nuscenes.yaml --xmem_cfg xmem_det/configs/xmem.yaml  --ckpt log/ckpt/phase1_phase1_epoch_16.pth --split val --seq_len 8 --stride 8 --keep_last_partial --thr 0.5 --eval_tag xmem_miou_len8_stride8_thr05_ep24
+
+coarsity
+vzorce LSTM
+loader
+no_grad correct now?
+
+ahoj, hej to je pravda, ze je to bez alignment potom pravdepodobne prilis velky rozdiel. Berkley si podla mna pochopil spravne ked tam pisu 
+"Our method, referred to as PP-REC, divides the most recent 10 LiDAR frames into three point clouds."
+Je to relativne slabe, lebo nikde neporovnali napr. viac ako 3 tych ich zoskupeni, alebo preco sa to rozhodli zrovna rozdelit na 3 ked im to potom ani nevychadza rovnomerne, ale ako baseline na porovnanie a overenie implementacie to postaci.
+ 
+Pozeral som aj tu GRU implementaciu, a ak to stale pouzivas ako to je na repe tak skontroluj este ten finalny vzorec na hidden state co mas 
+h_next = (1 - z) * h + z * h_candidate
+a podla pytorch docs by mal byt
+h_next = (1 - z) * h_candidate + z * h
+ 
+a potom este toto bude podla mna problem
+with torch.no_grad():
+
+     for t in range(num_warmup):
+
+         h = self.conv_gru(bev_list[t], h)
+ 
+ak dobre rozumiem tomu co sa tam deje, tak to v podstate zakaze GRU ucit sa podla warmup frameov. Konceptualne podla LSTM reference by to malo byt skor
+ 
+        for t in range(num_warmup):
+
+             h_t, c_t = self.conv_gru(bev_list[t], h_c)
+
+             h_c = (h_t, c_t)
+
+         preds = self.ssd_head(h_t)
