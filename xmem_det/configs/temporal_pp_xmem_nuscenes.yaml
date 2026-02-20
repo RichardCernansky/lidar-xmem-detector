@@ -1,5 +1,5 @@
 TRAIN:
-  SEQ_LEN: 8
+  SEQ_LEN: 10 
   STRIDE: 4
   VAL_EVAL_INTERVAL: 1
   LOG_INTERVAL: 50
@@ -26,7 +26,7 @@ ADDONS:
     # RESUME_CKPT: "/home/cernanskyr/pp_xmem_det/log/ckpt/phase0_only_seq8_epoch_5.pth"
     RESUME_CKPT: null
     # PRETRAINED_PP_CKPT: null
-    PRETRAINED_PP_CKPT: "/home/cernanskyr/OpenPCDet/output/cfgs/nuscenes_models/cbgs_dyn_pp_centerpoint/dynpp_centerpoint_pretrain/ckpt/checkpoint_epoch_20.pth"
+    PRETRAINED_PP_CKPT: "/home/cernanskyr/OpenPCDet/output/cfgs/nuscenes_models/cbgs_dyn_pp_centerpoint/dynpp_centerpoint_pretrain_coarse/ckpt/checkpoint_epoch_20.pth"
 
     USE_CKPT_EPOCH: true
     RESUME_OPTIM_SCHED: false
@@ -52,11 +52,10 @@ ADDONS:
 
   PHASES:
     "0":
-      # PREFIXES: ["xmem", "bev_adapter"]
       PREFIXES: ['conv_lstm', 'dense_head', 'lstm_proj']
 
       START_EPOCH: 0
-      END_EPOCH: 6
+      END_EPOCH: 30 
 
       LR_START: 2e-5
       LR_MAX: 2e-5
@@ -75,7 +74,7 @@ ADDONS:
 
       OPT_GROUP_SPECS:
         - PREFIXES: ["dense_head"]
-          LR_MULT: 
+          LR_MULT: 1.0
         - PREFIXES: ['conv_lstm']
           LR_MULT: 1.0
         - PREFIXES: ['lstm_proj']
@@ -134,7 +133,7 @@ DATA_CONFIG:
             }
 
         -   NAME: transform_points_to_voxels_placeholder
-            VOXEL_SIZE: [0.2, 0.2, 8.0]
+            VOXEL_SIZE: [0.32, 0.32, 8.0]
 
 MODEL:
     NAME: CenterPoint
