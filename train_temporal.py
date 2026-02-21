@@ -93,10 +93,7 @@ def build_seq_loader(cfg_obj, logger, workers_arg: int):
         training=True,
         root_path=None,
         logger=logger,
-        seq_len=int(seq_len),
-        stride=int(stride),
-        nusc_version=dataset_cfg.VERSION,
-        nusc_dataroot=dataset_cfg.DATA_PATH,
+        num_groups=int(seq_len),
     )
 
     num_workers_cap = cfg_req_int(cfg_obj, "OPTIMIZATION.NUM_WORKERS")

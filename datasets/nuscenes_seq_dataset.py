@@ -28,108 +28,72 @@ def collate_seq(batch):
 
 
 class NuScenesSeqDataset(Dataset):
-    def __init__(
-        self,
-        dataset_cfg,
-        class_names,
-        training,
-        logger,
-        seq_len,
-        stride,
-        nusc_version,
-        nusc_dataroot,
-        root_path=None,
-    ):
+    def __init__(self, dataset_cfg, class_names, training, logger,
+                 num_groups, root_path=None):
         super().__init__()
         self.base = NuScenesDataset(
-            dataset_cfg=dataset_cfg,
-            class_names=class_names,
-            training=training,
-            root_path=root_path,
-            logger=logger,
+            dataset_cfg=dataset_cfg, class_names=class_names,
+            training=training, root_path=root_path, logger=logger,
         )
-        self.seq_len = int(seq_len)
-        self.stride = int(stride)
-
+        self.num_groups = num_groups
+        self.max_sweeps = self.base.dataset_cfg.MAX_SWEEPS
         self.class_names = self.base.class_names
 
-        dataroot_for_nusc = Path(nusc_dataroot) / nusc_version
-
-        self.nusc = NuScenes(
-            version=nusc_version,
-            dataroot=str(dataroot_for_nusc),
-            verbose=False,
-        )
-
-        self.sequence_indices = self._build_sequences()
-
-    def _build_sequences(self):
-        by_scene = {}
-        for idx, info in enumerate(self.base.infos):
-            sample_token = info.get("token", None)
-            if sample_token is None:
-                raise KeyError("token not found in info; cannot derive scene_id")
-            sample = self.nusc.get("sample", sample_token)
-            scene_id = sample["scene_token"]
-            by_scene.setdefault(scene_id, []).append(idx)
-
-        sequences = []
-        for scene_id, idxs in by_scene.items():
-            idxs_sorted = sorted(
-                idxs,
-                key=lambda i: self.base.infos[i]["timestamp"],
-            )
-            L = len(idxs_sorted)
-            if L < self.seq_len:
-                continue
-            for start in range(0, L - self.seq_len + 1, self.stride):
-                seq = idxs_sorted[start:start + self.seq_len]
-                sequences.append(seq)
-
-                # if len(sequences) >= 100:
-                #     return sequences
-        return sequences
-
     def __len__(self):
-        return len(self.sequence_indices)
+        return len(self.base)
 
-    def _world_T_lidar_from_info(self, info):
-        sample = self.nusc.get("sample", info["token"])
-        sd_lidar = self.nusc.get("sample_data", sample["data"]["LIDAR_TOP"])
-        ep = self.nusc.get("ego_pose", sd_lidar["ego_pose_token"])
-        cs = self.nusc.get("calibrated_sensor", sd_lidar["calibrated_sensor_token"])
-        world_T_ego = transform_matrix(ep["translation"], Quaternion(ep["rotation"]), inverse=False)
-        ego_T_lidar = transform_matrix(cs["translation"], Quaternion(cs["rotation"]), inverse=False)
-        return world_T_ego @ ego_T_lidar
+    def get_sweep_groups(self, index):
+        """
+        Load all sweeps for one keyframe and split into num_groups groups.
+        All sweeps are already transformed to the current frame by the base loader.
+        """
+        info = self.base.infos[index]
+        lidar_path = self.base.root_path / info['lidar_path']
 
+        # Current frame — timestamp = 0
+        cur_pts = np.fromfile(str(lidar_path), dtype=np.float32).reshape(-1, 5)[:, :4]
+        cur_times = np.zeros((cur_pts.shape[0], 1), dtype=np.float32)
+
+        # Past sweeps — already in current frame's coordinate system
+        all_sweeps = [(cur_pts, cur_times)]  # newest first
+        for sweep in info['sweeps'][:self.max_sweeps - 1]:
+            pts, times = self.base.get_sweep(sweep)
+            all_sweeps.append((pts, times))
+
+        # Reverse so oldest → newest
+        all_sweeps = list(reversed(all_sweeps))
+
+        # Split into num_groups and concatenate each group
+        n = len(all_sweeps)
+        groups = []
+        for g in range(self.num_groups):
+            start = (g * n) // self.num_groups
+            end = ((g + 1) * n) // self.num_groups
+            pts = np.concatenate([s[0] for s in all_sweeps[start:end]], axis=0)
+            times = np.concatenate([s[1] for s in all_sweeps[start:end]], axis=0).astype(pts.dtype)
+            groups.append(np.concatenate([pts, times], axis=1))  # [N, 5]
+
+        return groups
 
     def __getitem__(self, index):
-        idx_seq = self.sequence_indices[index]
-        infos_seq = [self.base.infos[i] for i in idx_seq]
+        sweep_groups = self.get_sweep_groups(index)
 
-        T_world_lidar = []
-        sample_tokens = []
-        timestamps = []
+        # Build a batch_dict for each group through the base prepare_data
+        frames = []
+        info = self.base.infos[index]
+        for g, pts in enumerate(sweep_groups):
+            input_dict = {'points': pts, 'frame_id': f"{Path(info['lidar_path']).stem}_g{g}"}
 
-        for info in infos_seq:
-            T = self._world_T_lidar_from_info(info)
-            T_world_lidar.append(T.astype(np.float32))
-            sample_tokens.append(info["token"])
-            timestamps.append(info["timestamp"])
+            # Only the final group carries ground truth labels
+            if g == self.num_groups - 1:
+                base_sample = self.base.__getitem__(index)
+                input_dict['gt_names'] = base_sample.get('gt_names', np.array([]))
+                input_dict['gt_boxes'] = base_sample.get('gt_boxes', np.zeros((0, 9)))
+            else:
+                input_dict['gt_names'] = np.array([])
+                input_dict['gt_boxes'] = np.zeros((0, 9))
 
-        T_world_lidar = np.stack(T_world_lidar, axis=0)
+            data_dict = self.base.prepare_data(data_dict=input_dict)
+            frames.append(self.base.collate_batch([data_dict]))
 
-        frames_raw = [self.base.__getitem__(i) for i in idx_seq]
-        frames = [self.base.collate_batch([f]) for f in frames_raw]
-
-
-        sample = {
-            "frames": frames,
-            "T_world_lidar": T_world_lidar,
-            "sample_tokens": sample_tokens,
-            "timestamps": np.array(timestamps, dtype=np.int64),
-        }
-
-        
-        return sample
-
+        return {'frames': frames}

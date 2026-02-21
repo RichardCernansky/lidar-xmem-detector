@@ -1,5 +1,5 @@
 TRAIN:
-  SEQ_LEN: 10 
+  SEQ_LEN: 3 #num groups
   STRIDE: 4
   VAL_EVAL_INTERVAL: 1
   LOG_INTERVAL: 50
@@ -55,7 +55,7 @@ ADDONS:
       PREFIXES: ['conv_lstm', 'dense_head', 'lstm_proj']
 
       START_EPOCH: 0
-      END_EPOCH: 30 
+      END_EPOCH: 10 
 
       LR_START: 2e-5
       LR_MAX: 2e-5
@@ -87,7 +87,7 @@ ADDONS:
     "1":
       PREFIXES: ['bank.', 'dense_head.', 'backbone_2d.']
       START_EPOCH: 0
-      END_EPOCH: 8
+      END_EPOCH: 10 
 
       LR_START: 2e-5
       LR_MAX: 2e-5
