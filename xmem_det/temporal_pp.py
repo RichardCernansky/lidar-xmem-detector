@@ -64,7 +64,7 @@ class TemporalPointPillar(PointPillar):
         2. Process through ConvLSTM to aggregate temporal information
         3. Run detection head on final timestep only
     """
-    def __init__(self, model_cfg, num_class, dataset, pc_range, lstm_hidden_dim: int = 128):
+    def __init__(self, model_cfg, num_class, dataset, pc_range, lstm_hidden_dim: int = 384):
         super().__init__(model_cfg=model_cfg, num_class=num_class, dataset=dataset)
         
         if pc_range is None:
@@ -73,9 +73,10 @@ class TemporalPointPillar(PointPillar):
         
         # Get BEV feature dimension from backbone
         self.c_bev = int(self.backbone_2d.num_bev_features)
-        
+
         # ConvLSTM for temporal processing
         self.lstm_hidden_dim = int(lstm_hidden_dim)
+        
         self.conv_lstm = ConvLSTMCell(
             input_dim=self.c_bev,
             hidden_dim=self.lstm_hidden_dim,

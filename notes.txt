@@ -80,3 +80,8 @@ ak dobre rozumiem tomu co sa tam deje, tak to v podstate zakaze GRU ucit sa podl
              h_c = (h_t, c_t)
 
          preds = self.ssd_head(h_t)
+
+pozeral som toto posledne repo co si posielal, len som bol zrejme v zlej branchi. V tomto sa ten hlavny cyklus zda byt spravny, cize ked mas prerobene tie jednotlive reprezentacie na pointclouds ako oni popisovali, tak by to malo replikovat ich vysledky na nuscenes.
+Z ich popisu mi pride, ze implikuju len jednu LSTM cell, prefeedovanu postupne jednotlivymi timestepmi. Viac za sebou pre kazdy input moze pomoct, kedze tie hladane patterny vedia byt komplexne, ale nepride mi, ze by to robili.
+ 
+Na co si ale daj pozor su tie projections medzi lstm_hidden_dim a c_bev. Velke skoky vo features bez toho aby mal model kapacitu sa naucit rozumnu kompresiu alebo expanziu vedia vyrazne zabit kolko informacie sa presiri 
