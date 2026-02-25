@@ -54,6 +54,7 @@ coarsity
 vzorce LSTM
 loader
 no_grad correct now?
+loss on all timesteps?
 
 ahoj, hej to je pravda, ze je to bez alignment potom pravdepodobne prilis velky rozdiel. Berkley si podla mna pochopil spravne ked tam pisu 
 "Our method, referred to as PP-REC, divides the most recent 10 LiDAR frames into three point clouds."
@@ -85,3 +86,11 @@ pozeral som toto posledne repo co si posielal, len som bol zrejme v zlej branchi
 Z ich popisu mi pride, ze implikuju len jednu LSTM cell, prefeedovanu postupne jednotlivymi timestepmi. Viac za sebou pre kazdy input moze pomoct, kedze tie hladane patterny vedia byt komplexne, ale nepride mi, ze by to robili.
  
 Na co si ale daj pozor su tie projections medzi lstm_hidden_dim a c_bev. Velke skoky vo features bez toho aby mal model kapacitu sa naucit rozumnu kompresiu alebo expanziu vedia vyrazne zabit kolko informacie sa presiri 
+
+
+Problems:
+CenterPoint is overall better than SSD - improvements harder - run SSD?
+
+e2e joint training from scratch on CenterPoint/SSD - need to enable all the data augmentations
+or
+now training random head init we ll see

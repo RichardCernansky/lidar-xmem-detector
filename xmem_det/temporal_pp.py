@@ -150,8 +150,11 @@ class TemporalPointPillar(PointPillar):
                     batch_idx=0,
                 )
         
-        # Step 3: Project LSTM output to BEV feature space
-        bev_temporal = self.lstm_proj(h)  # [B, c_bev, H, W]
+        # Step 3: Project LSTM output and add residual from final backbone frame.
+        # At init lstm_proj(h) ≈ random small values, so the head sees ~backbone
+        # features and starts near baseline; the LSTM learns to add corrections.
+        bev_temporal = bev_list[-1] + self.lstm_proj(h)  # [B, c_bev, H, W]
+        
         
         # Step 4: Run detection head on final frame
         frames_list[-1]["spatial_features_2d"] = bev_temporal

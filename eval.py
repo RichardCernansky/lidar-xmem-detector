@@ -69,6 +69,7 @@ def main():
     eval_output_dir = output_dir / "eval_sweep" / args.eval_tag
     eval_output_dir.mkdir(parents=True, exist_ok=True)
 
+    print(eval_output_dir, "------------------")
     log_file = eval_output_dir / ("log_eval_%s.txt" % datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
     logger = common_utils.create_logger(log_file, rank=0)
 
