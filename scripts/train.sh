@@ -4,9 +4,10 @@ set -euo pipefail
 CFG_FILE="xmem_det/configs/temporal_pp_xmem_nuscenes.yaml"
 XMEM_CFG="xmem_det/configs/xmem.yaml"
 
-EXTRA_TAG="only_seq8"
+EXTRA_TAG="10hz_"
 WORKERS=4
 
+CUDA_VISIBLE_DEVICES=0
 
 python train_temporal.py \
   --cfg_file "$CFG_FILE" \

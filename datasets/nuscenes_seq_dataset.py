@@ -1,24 +1,7 @@
 import numpy as np
 from torch.utils.data import Dataset
-from pathlib import Path
-
-from nuscenes.nuscenes import NuScenes
-from nuscenes.utils.geometry_utils import transform_matrix
-from pyquaternion import Quaternion
 
 from pcdet.datasets.nuscenes.nuscenes_dataset import NuScenesDataset
-
-
-def relative_T_lidar(T_world_lidar):
-    T_world_lidar = np.asarray(T_world_lidar)
-    assert T_world_lidar.ndim == 3 and T_world_lidar.shape[1:] == (4, 4)
-    T_rel = []
-    T0 = T_world_lidar[0]
-    for t in range(T_world_lidar.shape[0]):
-        Tt = T_world_lidar[t]
-        T = np.linalg.inv(Tt) @ T0
-        T_rel.append(T.astype(np.float32))
-    return np.stack(T_rel, axis=0)
 
 
 def collate_seq(batch):
@@ -28,6 +11,25 @@ def collate_seq(batch):
 
 
 class NuScenesSeqDataset(Dataset):
+    """
+    Each dataset item = one NuScenes keyframe + its preceding LiDAR sweeps
+    as individual frames, forming a ~10 Hz temporal sequence.
+
+    Layout of one item (oldest → newest):
+        [sweep_{-N}, sweep_{-N+2}, ..., sweep_{-2}, sweep_{-1}, KEYFRAME]
+
+    - Sweep frames: backbone only, no gt_boxes, no detection loss.
+    - Keyframe    : backbone + detection head + loss (has gt_boxes).
+    - Bank resets at the start of every forward() call, so each item is
+      an independent episode — no cross-keyframe memory.
+
+    Args:
+        seq_len     : max sweep frames BEFORE the keyframe.
+                      Set to MAX_SWEEPS // sweep_stride in config.
+        stride      : keyframe-level stride, subsample training set for speed.
+        sweep_stride: every N-th sweep is kept; 2 gives ~10 Hz from ~20 Hz.
+    """
+
     def __init__(
         self,
         dataset_cfg,
@@ -36,9 +38,10 @@ class NuScenesSeqDataset(Dataset):
         logger,
         seq_len,
         stride,
-        nusc_version,
-        nusc_dataroot,
+        nusc_version,    # kept for API compat, unused
+        nusc_dataroot,   # kept for API compat, unused
         root_path=None,
+        sweep_stride: int = 2,
     ):
         super().__init__()
         self.base = NuScenesDataset(
@@ -48,88 +51,60 @@ class NuScenesSeqDataset(Dataset):
             root_path=root_path,
             logger=logger,
         )
-        self.seq_len = int(seq_len)
-        self.stride = int(stride)
-
-        self.class_names = self.base.class_names
-
-        dataroot_for_nusc = Path(nusc_dataroot) / nusc_version
-
-        self.nusc = NuScenes(
-            version=nusc_version,
-            dataroot=str(dataroot_for_nusc),
-            verbose=False,
-        )
+        self.seq_len      = int(seq_len)
+        self.stride       = int(stride)
+        self.sweep_stride = int(sweep_stride)
+        self.class_names  = self.base.class_names
 
         self.sequence_indices = self._build_sequences()
 
     def _build_sequences(self):
-        by_scene = {}
-        for idx, info in enumerate(self.base.infos):
-            sample_token = info.get("token", None)
-            if sample_token is None:
-                raise KeyError("token not found in info; cannot derive scene_id")
-            sample = self.nusc.get("sample", sample_token)
-            scene_id = sample["scene_token"]
-            by_scene.setdefault(scene_id, []).append(idx)
-
-        sequences = []
-        for scene_id, idxs in by_scene.items():
-            idxs_sorted = sorted(
-                idxs,
-                key=lambda i: self.base.infos[i]["timestamp"],
-            )
-            L = len(idxs_sorted)
-            if L < self.seq_len:
-                continue
-            for start in range(0, L - self.seq_len + 1, self.stride):
-                seq = idxs_sorted[start:start + self.seq_len]
-                sequences.append(seq)
-
-                # if len(sequences) >= 100:
-                #     return sequences
-        return sequences
+        # One index per keyframe; stride subsamples for training speed.
+        return list(range(0, len(self.base.infos), self.stride))
 
     def __len__(self):
         return len(self.sequence_indices)
 
-    def _world_T_lidar_from_info(self, info):
-        sample = self.nusc.get("sample", info["token"])
-        sd_lidar = self.nusc.get("sample_data", sample["data"]["LIDAR_TOP"])
-        ep = self.nusc.get("ego_pose", sd_lidar["ego_pose_token"])
-        cs = self.nusc.get("calibrated_sensor", sd_lidar["calibrated_sensor_token"])
-        world_T_ego = transform_matrix(ep["translation"], Quaternion(ep["rotation"]), inverse=False)
-        ego_T_lidar = transform_matrix(cs["translation"], Quaternion(cs["rotation"]), inverse=False)
-        return world_T_ego @ ego_T_lidar
+    def _load_sweep_points(self, sweep_info: dict) -> np.ndarray:
+        # Delegate entirely to OpenPCDet's get_sweep which handles
+        # file loading, ego-point removal, transform_matrix application,
+        # and time_lag — returns (points [N,4], times [N,1]).
+        points, times = self.base.get_sweep(sweep_info)
+        return np.concatenate([points, times], axis=1).astype(np.float32)  # [N,5]
 
+    def _points_to_batch_dict(self, points: np.ndarray) -> dict:
+        # Run voxelization only (no augmentation) then collate.
+        data_dict = {"points": points}
+        data_dict = self.base.data_processor.forward(data_dict=data_dict)
+        return self.base.collate_batch([data_dict])
 
     def __getitem__(self, index):
-        idx_seq = self.sequence_indices[index]
-        infos_seq = [self.base.infos[i] for i in idx_seq]
+        kf_idx = self.sequence_indices[index]
+        info   = self.base.infos[kf_idx]
 
-        T_world_lidar = []
-        sample_tokens = []
-        timestamps = []
+        # info['sweeps']: newest→oldest, length up to MAX_SWEEPS.
+        # Take every sweep_stride-th, cap at seq_len, reverse to oldest→newest.
+        sweeps     = info.get("sweeps", [])
+        subsampled = sweeps[::self.sweep_stride][:self.seq_len][::-1]
 
-        for info in infos_seq:
-            T = self._world_T_lidar_from_info(info)
-            T_world_lidar.append(T.astype(np.float32))
-            sample_tokens.append(info["token"])
-            timestamps.append(info["timestamp"])
+        frames = []
 
-        T_world_lidar = np.stack(T_world_lidar, axis=0)
+        # Sweep frames: backbone only, no gt_boxes
+        for sw in subsampled:
+            pts = self._load_sweep_points(sw)
+            frames.append(self._points_to_batch_dict(pts))
 
-        frames_raw = [self.base.__getitem__(i) for i in idx_seq]
-        frames = [self.base.collate_batch([f]) for f in frames_raw]
+        # Keyframe: disable augmentor so it stays in the same coordinate
+        # frame as the sweep frames (augmentation would break bank attention).
+        was_training       = self.base.training
+        self.base.training = False
+        kf_raw             = self.base.__getitem__(kf_idx)
+        self.base.training = was_training
 
+        frames.append(self.base.collate_batch([kf_raw]))
 
-        sample = {
-            "frames": frames,
-            "T_world_lidar": T_world_lidar,
-            "sample_tokens": sample_tokens,
-            "timestamps": np.array(timestamps, dtype=np.int64),
+        return {
+            "frames"      : frames,
+            "sample_token": info["token"],
+            "timestamp"   : info["timestamp"],
         }
-
-        
-        return sample
-
