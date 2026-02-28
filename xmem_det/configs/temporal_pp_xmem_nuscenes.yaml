@@ -16,7 +16,7 @@ ADDONS:
     LOG_FILE_TEMPLATE: "train_temporal_pp_{tag}.txt"
 
     VIS_DIR: "log/vis"
-    VIS_EVERY_SEQS: 50
+    VIS_EVERY_SEQS: 200
     VIS_TAG_TEMPLATE: "ep{epoch}_seq{seq:05d}"
     VIS_B: 0
 

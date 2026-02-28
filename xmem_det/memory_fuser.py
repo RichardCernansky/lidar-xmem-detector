@@ -140,14 +140,14 @@ class ReasonNetTemporalBank(nn.Module):
         self,
         c_bev: int,
         key_dim: int = 64,
-        ts: int = 4,                    # short-term buffer size (frames)
+        ts: int = 2,                    # short-term buffer size (frames)
         tl: int = 0,                    # long-term buffer size (frames), 0 = disabled
         tau: int = 2,                   # update bank every tau steps
         long_frame_tokens: int = 2048,  # max tokens per long-term frame
         obj_prob_thresh: float = 0.3,   # existence threshold for LT selection
         topk_usage: int = 512,          # top-K by usage frequency for LT selection
         max_from_discard: int = 2048,   # max tokens promoted from one ST frame
-        q_chunk: int = 64,             # chunk size for memory read (memory saving)
+        q_chunk: int = 512,             # chunk size for memory read (memory saving)
         convgru_kernel: int = 3,
     ):
         super().__init__()
@@ -472,7 +472,8 @@ class ReasonNetTemporalBank(nn.Module):
 
         # Step 4: ConvGRU sequential fusion
         # process history FIRST (oldest → newest), current frame LAST.
-        h_t = self._gru_h  # start from persistent state (detached value from last step)
+        # h_t = self._gru_h  # start from persistent state (detached value from last step)
+        h_t = torch.zeros_like(self._gru_h)  # begin from zero - aggregator only
 
         # History: memory readouts ordered oldest → newest (as returned by _collect_memory)
         for m_map in m_frames:

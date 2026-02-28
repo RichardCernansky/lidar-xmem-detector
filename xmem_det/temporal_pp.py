@@ -281,22 +281,22 @@ class TemporalPointPillar(PointPillar):
         # We run all frames through VFE → MAP_TO_BEV → BACKBONE_2D but stop
         # before the dense_head (temporal fusion happens between backbone and head).
         # ------------------------------------------------------------------
-        bev_list = []
-        for t in range(T):
-            bd = frames_list[t]
-            for cur_module in self.module_list:
-                if cur_module is self.dense_head:
-                    break                          # stop before detection head
-                bd = cur_module(bd)
-            frames_list[t] = bd
-            bev_list.append(bd["spatial_features_2d"])  # [B, C, H, W]
+        # bev_list = []
+        # for t in range(T):
+        #     bd = frames_list[t]
+        #     for cur_module in self.module_list:
+        #         if cur_module is self.dense_head:
+        #             break                          # stop before detection head
+        #         bd = cur_module(bd)
+        #     frames_list[t] = bd
+        #     bev_list.append(bd["spatial_features_2d"])  # [B, C, H, W]
 
         # ------------------------------------------------------------------
         # Step 2: Reset bank for this new sequence.
         # Done AFTER backbone pass so any exception in backbone doesn't leave
         # the bank in a half-reset state for the temporal loop.
         # ------------------------------------------------------------------
-        self.bank.reset()
+        # self.bank.reset()
 
         mfused_last = None
         dbg_last    = None
@@ -316,26 +316,23 @@ class TemporalPointPillar(PointPillar):
         # ------------------------------------------------------------------
         # Step 3: Temporal reasoning loop — oldest frame to newest (keyframe).
         # ------------------------------------------------------------------
+        self.bank.reset()
+
         for t in range(T):
-            bev_t = bev_list[t]   # [B, C, H, W] — current frame's backbone output
-
-            # --- 3a. Fuse temporal context into current BEV ---
-            # compute_mfused:
-            #   1) encodes bev_t into query q_t via Conv1x1
-            #   2) reads from bank (attention over stored key/value pairs)
-            #   3) steps ConvGRU: history readouts first (oldest→newest), then bev_t last
-            #      so final hidden state represents "current frame given all history"
-            #   4) saves h_t.detach() as _gru_h for next real timestep (truncated BPTT)
-            #   5) returns mfused_t = GroupNorm(h_t)  — gradient graph intact for this step
+            bd = frames_list[t]
+            
+            # Run backbone for this frame only
+            for cur_module in self.module_list:
+                if cur_module is self.dense_head:
+                    break
+                bd = cur_module(bd)
+            frames_list[t] = bd
+            bev_t = bd["spatial_features_2d"]
+            
+            # Immediately fuse and update bank
+            # bev_t from early frames can be freed after bank.update_bank()
             mfused_t, dbg_t = self.bank.compute_mfused(bev_t)
-
-            # --- 3b. Generate Mp_t: 7-channel BEV map to condition bank storage ---
             mp_t = self._get_mp_from_head_nograd(frames_list[t], mfused_t)
-
-            # --- 3c. Update memory bank ---
-            # Stores (q_t as key, value_enc(mfused_t, mp_t) as value) every tau steps.
-            # When short-term buffer is full, evicts oldest frame to long-term buffer
-            # using Mp_t channel 0 and usage frequency as selection criteria.
             self.bank.update_bank(dbg_t["q_t"], mfused_t, mp_t)
 
             if do_viz:
@@ -346,13 +343,18 @@ class TemporalPointPillar(PointPillar):
                     bank_state=bank_state, bank_maps=bank_maps,
                     mem_kinds=dbg_t["mem_kinds"], batch_idx=0
                 )
+            
+            # Explicitly free early frame BEV — no longer needed
+            if t < T - 1:
+                del bev_t
+                del mfused_t
+                frames_list[t] = None   # free the batch dict too
+            else:
+                mfused_last = mfused_t
+                dbg_last = dbg_t
+                mp_last = mp_t
 
-            # Keep only the last frame's outputs for detection
-            if t == T - 1:
-                mfused_last = mfused_t   # temporally enriched keyframe features
-                dbg_last    = dbg_t
-                mp_last     = mp_t
-
+        
         if do_viz:
             debugger.finish_sequence()
         self.vis_counter += 1
