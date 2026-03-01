@@ -56,3 +56,5 @@ gt_sampling is disabled — this is the most impactful augmentation for underbal
 Without gt_sampling, balanced resampling alone gives only modest improvement for rare classes
 Augmentations are disabled to preserve spatial consistency between sweep frames and keyframe — augmenting only the keyframe would misalign temporal bank features
 Proper fix would be applying the same augmentation to the entire sequence (all sweeps + keyframe together), but this requires non-trivial changes to the OpenPCDet dataloader
+- gru Z swap form torch implementation - OK 
+- query enc - couple of conv layers
