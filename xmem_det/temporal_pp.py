@@ -218,7 +218,6 @@ class TemporalPointPillar(PointPillar):
 
             # Build the 6 geometry channels to scatter: [B, num_max_objs, 6]
             K = target_boxes.shape[2]
-            print(K)
             box_feats = torch.zeros(B, inds.shape[1], 6, device=device, dtype=dtype)
 
             box_feats[:, :, 0] = target_boxes[:, :, 0]           # x offset

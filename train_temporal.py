@@ -234,6 +234,12 @@ def train_one_epoch(
         optimizer.zero_grad()
         torch.autograd.set_detect_anomaly(True)
         loss.backward()
+
+        # DEBUG VALS
+        # head_grad = model.dense_head.heads_list[0].hm[-1].weight.grad.abs().mean()
+        # print("head", head_grad)
+        # print("bank", model.bank.query_enc.weight.grad.abs().mean())
+
         clip_grad_norm_(model.parameters(), float(max_grad_norm))
         optimizer.step()
         if scheduler is not None:

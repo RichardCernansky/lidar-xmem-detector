@@ -165,7 +165,11 @@ class ReasonNetTemporalBank(nn.Module):
         # Query encoder: projects BEV features to a lower-dim key space.
         # Keys are in R^key_dim, values stay in R^c_bev.
         # Smaller key_dim reduces attention computation cost.
-        self.query_enc = nn.Conv2d(self.c_bev, self.key_dim, kernel_size=1, bias=True)
+        self.query_enc = nn.Sequential(
+            nn.Conv2d(self.c_bev, self.c_bev // 2, kernel_size=3, padding=1, bias=True),
+            nn.ReLU(),
+            nn.Conv2d(self.c_bev // 2, self.key_dim, kernel_size=3, padding=1, bias=True),
+        )
 
         # ConvGRU: persistent hidden state [B, c_bev, H, W].
         # input_dim == hidden_dim == c_bev because both memory readouts
@@ -482,9 +486,16 @@ class ReasonNetTemporalBank(nn.Module):
         # Current frame last: h_t now represents "current BEV given all temporal context"
         h_t = self.gru(bev_t, h_t)
 
+        # DEBUG VALS
+        # with torch.no_grad():
+        #     xh = torch.cat([bev_t, h_t], dim=1)
+        #     rz = torch.sigmoid(self.gru.gates(xh))
+        #     _, z = rz.chunk(2, dim=1)
+        #     print(f"GRU z gate mean={z.mean():.3f} std={z.std():.3f}")
+
         # _gru_h is used as the starting h in the NEXT call — it carries temporal
         # information forward in time without carrying the computation graph.
-        self._gru_h = h_t.detach()
+        # self._gru_h = h_t.detach()
 
         # Step 6: normalise and return.
         # mfused_t uses the ORIGINAL h_t (not detached) so gradients from loss

@@ -1,5 +1,5 @@
 TRAIN:
-  SEQ_LEN: 10 
+  SEQ_LEN: 5
   STRIDE: 1
   VAL_EVAL_INTERVAL: 1
   LOG_INTERVAL: 200
@@ -23,13 +23,13 @@ ADDONS:
     CKPT_DIR: "log/ckpt"
 
     # either one of RESUME_CKPT and PRETRAINED_PP_CKPT can be set to non-null
-    # RESUME_CKPT: "/home/cernanskyr/pp_xmem_det/log/ckpt/phase0_only_seq8_epoch_5.pth"
+    # RESUME_CKPT: "log/ckpt/phase0_10hz_epoch_1_seq22000.pth"
     RESUME_CKPT: null
     # PRETRAINED_PP_CKPT: null
     PRETRAINED_PP_CKPT: "/home/cernanskyr/OpenPCDet/output/cfgs/nuscenes_models/cbgs_dyn_pp_centerpoint/dynpp_centerpoint_pretrain/ckpt/checkpoint_epoch_20.pth"
 
     USE_CKPT_EPOCH: true
-    RESUME_OPTIM_SCHED: false
+    RESUME_OPTIM_SCHED: false 
 
   DATALOADER:
     BATCH_SIZE: 1
@@ -55,7 +55,7 @@ ADDONS:
       PREFIXES: ["bank", "dense_head"]
 
       START_EPOCH: 0
-      END_EPOCH: 1 
+      END_EPOCH: 3
 
       LR_START: 3e-5
       LR_MAX: 3e-5
