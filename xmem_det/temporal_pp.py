@@ -151,6 +151,7 @@ class TemporalPointPillar(PointPillar):
         self.dense_head.train(was_training)  # restore training mode
         return mp_combined
 
+    # not needed now
     def _create_mp_from_gt(self, batch_dict: dict) -> torch.Tensor:
         """
         Alternative Mp_t from GT boxes via CenterPoint's target assignment.
@@ -177,7 +178,6 @@ class TemporalPointPillar(PointPillar):
 
         mp_t = self._convert_target_dict_to_mp(target_dict, B, H, W, device, dtype)
         return mp_t
-
     def _convert_target_dict_to_mp(
         self,
         target_dict: dict,

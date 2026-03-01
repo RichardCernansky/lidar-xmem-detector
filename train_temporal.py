@@ -143,6 +143,11 @@ def train_one_epoch(
     loop_cfg: Any,
     run_cfg: Any,
     probs: Dict[str, float],
+    phase_id: str,       #saving stuff
+    extra_tag: str,       
+    ckpt_name_tpl: str,     
+    ckpt_dir: str,          
+    save_every_seqs = 2000,   
 ):
     model.train()
 
@@ -154,6 +159,29 @@ def train_one_epoch(
 
     det_mask_prev = None
     for seq_idx, seq in enumerate(train_loader):
+        # Mid-epoch checkpoint every N sequences
+        if save_every_seqs > 0 and (seq_idx + 1) % save_every_seqs == 0:
+            ckpt_path = os.path.join(
+                ckpt_dir,
+                ckpt_name_tpl.format(
+                    phase=phase_id,
+                    tag=extra_tag,
+                    epoch=f"{epoch + 1}_seq{seq_idx + 1}"
+                ),
+            )
+            torch.save(
+                {
+                    "model_state": model.state_dict(),
+                    "epoch": epoch + 1,
+                    "seq_idx": seq_idx + 1,
+                    "optimizer_state": optimizer.state_dict(),
+                    "scheduler_state": scheduler.state_dict(),
+                    "phase": phase_id,
+                },
+                ckpt_path,
+            )
+            logger.info(f"Mid-epoch checkpoint saved to {ckpt_path}")
+
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats()
 
@@ -358,6 +386,11 @@ def train_phase(
             loop_cfg=loop_cfg,
             run_cfg=run_cfg,
             probs=probs,
+            phase_id=phase_id,
+            extra_tag=extra_tag,
+            ckpt_name_tpl=ckpt_name_tpl,
+            ckpt_dir=str(ckpt_dir),
+            save_every_seqs=2000, 
         )
 
         ckpt_path = os.path.join(

@@ -2,7 +2,7 @@ TRAIN:
   SEQ_LEN: 10 
   STRIDE: 1
   VAL_EVAL_INTERVAL: 1
-  LOG_INTERVAL: 50
+  LOG_INTERVAL: 200
 
 TEST:
   SPLIT: val
@@ -55,7 +55,7 @@ ADDONS:
       PREFIXES: ["bank", "dense_head"]
 
       START_EPOCH: 0
-      END_EPOCH: 10 
+      END_EPOCH: 1 
 
       LR_START: 3e-5
       LR_MAX: 3e-5
