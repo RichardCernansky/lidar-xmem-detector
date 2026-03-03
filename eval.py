@@ -1,26 +1,3 @@
-"""
-eval_temporal.py — Evaluation script for TemporalPointPillar with attention visualization.
-
-Fixes vs original:
-  1. Correct return-value unpacking: inference forward() returns (final_box, {}, None)
-     — pred_dicts IS final_box (list of box dicts), not a nested structure.
-  2. base_item index: uses seq_dataset keyframe_indices to map sequence → base dataset index,
-     instead of assuming sample_idx == base_idx (breaks when len(seq) != len(base)).
-  3. Bank reset ordering: reset_sequence() call before forward() is now the canonical reset;
-     the in-forward reset() is a safety net only.
-  4. Attention visualization: after every vis_interval sequences, dumps a ReasonNet-style
-     attention grid (one query location per object, T-1…T-4 frames) to PNG.
-  5. Proper eval mode throughout; no accidental train-mode BN updates.
-
-Usage:
-  python eval_temporal.py \
-      --cfg_file tools/cfgs/nuscenes_models/temporal_pp.yaml \
-      --ckpt output/.../checkpoint_epoch_20.pth \
-      --split val \
-      --num_groups 4 \
-      --vis_interval 50 \
-      --vis_dir ./attn_vis
-"""
 
 import argparse
 import datetime
@@ -77,71 +54,70 @@ class AttentionLogger:
 
     For each sequence we pick up to `max_query_pts` query locations
     (chosen near detected objects) and show their attention weights
-    over the last `n_hist` short-term memory frames.
+    over all frames currently stored in the short-term memory bank.
+
+    KEY DESIGN:
+      - q_t is passed in explicitly from dbg["q_t"] — the output of query_enc
+        applied to the current (not-yet-stored) BEV frame.
+      - ALL entries in bank._st_keys are historical frames (stored every tau steps).
+        With tau=2: _st_keys[0]=T-2*ts, ..., _st_keys[-1]=T-tau (last stored).
+      - Column titles reflect actual temporal distance: T-tau, T-2*tau, etc.
     """
 
     def __init__(
         self,
         save_dir: str,
-        n_hist: int = 4,            # number of past frames to visualise (T-1…T-n)
-        max_query_pts: int = 2,     # rows in the grid (one per query location)
+        n_hist: int = 4,
+        max_query_pts: int = 2,
+        tau: int = 2,
         q_chunk: int = 512,
     ):
-        self.save_dir     = Path(save_dir)
+        self.save_dir      = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
-        self.n_hist       = n_hist
+        self.n_hist        = n_hist
         self.max_query_pts = max_query_pts
-        self.q_chunk      = q_chunk
+        self.tau           = tau
+        self.q_chunk       = q_chunk
 
-        # Filled by capture() after the forward pass
-        self._attn_maps: Optional[np.ndarray] = None   # [n_pts, n_hist, H, W]
-        self._bev_maps:  Optional[np.ndarray] = None   # [n_hist, H, W]
-
-    # ------------------------------------------------------------------
-
-    def _l2_similarity(
-        self,
-        q_flat: torch.Tensor,  # [HW_q, key_dim]
-        k_flat: torch.Tensor,  # [M,    key_dim]
-    ) -> torch.Tensor:
-        """Normalised L2 similarity: S(q,k) = dist(q,k)^2 / sum_k dist(q,k)^2"""
-        # [HW_q, 1] + [1, M] - 2*[HW_q, M]  ->  [HW_q, M]
-        q2  = (q_flat * q_flat).sum(dim=1, keepdim=True)   # [HW_q, 1]
-        k2  = (k_flat * k_flat).sum(dim=1).unsqueeze(0)    # [1,    M]
-        dot = q_flat @ k_flat.T                             # [HW_q, M]
-        dist = (q2 + k2 - 2.0 * dot).clamp_min(0.0)       # [HW_q, M]
-        S    = dist / (dist.sum(dim=1, keepdim=True) + 1e-8)
-        return S                                            # [HW_q, M]
+        self._attn_maps:    Optional[np.ndarray] = None   # [n_pts, n_vis, H, W]
+        self._bev_maps:     Optional[np.ndarray] = None   # [n_vis, H, W]
+        self._n_vis:        int = 0
+        self._n_pts:        int = 0
+        self._query_pixels: list = []
 
     # ------------------------------------------------------------------
 
     @torch.no_grad()
     def capture(
         self,
-        bank: ReasonNetTemporalBank,
+        bank:       ReasonNetTemporalBank,
         pred_dicts: list,
+        q_t:        torch.Tensor,   # [B, key_dim, H, W] — current frame query from query_enc
     ):
         """
-        Call AFTER forward() — bank._st_keys still has the stored frames.
-        We compute the keyframe query from the most recent stored key directly
-        (q_t was stored as the key, so bank._st_keys[-1] IS the keyframe query).
+        Call AFTER forward().
+
+        q_t  : the actual current-frame query (NOT stored in bank).
+        bank : _st_keys contains only historical frames stored every tau steps.
+               _st_keys[-1] = most recent stored frame = T - tau
+               _st_keys[-2] = T - 2*tau
+               etc.
         """
-        if not bank._st_keys:
+        n_st = len(bank._st_keys)
+        if n_st == 0:
             return
 
-        n_st  = len(bank._st_keys)
-        n_vis = min(n_st - 1, self.n_hist)  # exclude keyframe's own entry
-        if n_vis == 0:
-            return
+        n_vis = min(n_st, self.n_hist)   # ALL stored frames are history
 
-        b, key_dim, h, w = bank._st_keys[-1].shape  # keyframe key = query
+        b, key_dim, h, w = q_t.shape
         hw = h * w
 
-        # The keyframe's query is exactly _st_keys[-1] (q_t was stored as key)
-        q_map  = bank._st_keys[-1]                          # [1, key_dim, H, W]
-        q_flat = q_map[0].reshape(key_dim, hw).T            # [HW, key_dim]
+        # Flatten current query
+        q_flat = q_t[0].reshape(key_dim, hw).T   # [HW, key_dim]
 
-        # Pick query locations from top-scoring detections
+        # ------------------------------------------------------------------
+        # Pick query pixel locations from top-scoring detections
+        # ------------------------------------------------------------------
         query_pixels = []
         if pred_dicts and "pred_scores" in pred_dicts[0]:
             scores = pred_dicts[0]["pred_scores"]
@@ -158,33 +134,37 @@ class AttentionLogger:
                     query_pixels.append((qi, qj))
 
         if not query_pixels:
-            # Fallback: highest-magnitude locations in the keyframe key map
-            mag = q_map[0].abs().mean(0)  # [H, W]
+            # Fallback: highest-magnitude locations in current query map
+            mag      = q_t[0].abs().mean(0)   # [H, W]
             flat_idx = mag.reshape(-1).topk(self.max_query_pts).indices
             for fi in flat_idx:
                 query_pixels.append((int(fi // w), int(fi % w)))
 
-        n_pts = len(query_pixels)
+        n_pts     = len(query_pixels)
         attn_maps = np.zeros((n_pts, n_vis, h, w), dtype=np.float32)
-        bev_maps  = np.zeros((n_vis, h, w), dtype=np.float32)
+        bev_maps  = np.zeros((n_vis, h, w),        dtype=np.float32)
 
-        # Iterate history frames: T-1 is _st_keys[-2], T-2 is _st_keys[-3], etc.
+        # ------------------------------------------------------------------
+        # Compute attention: q_t vs each historical stored frame
+        # Iterate newest → oldest: _st_keys[-1]=T-tau, _st_keys[-2]=T-2*tau, ...
+        # ------------------------------------------------------------------
         for vi in range(n_vis):
-            st_idx = n_st - 2 - vi          # skip [-1] which is the keyframe itself
-            k_map  = bank._st_keys[st_idx]  # [1, key_dim, H, W]
-            k_flat = k_map[0].reshape(key_dim, hw).T  # [HW, key_dim]
+            st_idx = n_st - 1 - vi              # newest first
+            k_map  = bank._st_keys[st_idx]      # [1, key_dim, H, W]
+            k_flat = k_map[0].reshape(key_dim, hw).T   # [HW, key_dim]
 
-            v_map = bank._st_vals[st_idx]
-            bev_maps[vi] = v_map[0].abs().mean(0).cpu().numpy()
+            # BEV context from stored values (for background in save())
+            bev_maps[vi] = bank._st_vals[st_idx][0].abs().mean(0).cpu().numpy()
 
             for pi, (qi, qj) in enumerate(query_pixels):
-                q_vec = q_flat[qi * w + qj].unsqueeze(0)    # [1, key_dim]
-                # L2 similarity (STCN)
-                q2   = (q_vec * q_vec).sum(dim=1, keepdim=True)
-                k2   = (k_flat * k_flat).sum(dim=1).unsqueeze(0)
-                dot  = q_vec @ k_flat.T
-                dist = (q2 + k2 - 2.0 * dot).clamp_min(0.0)  # [1, HW]
-                S    = dist / (dist.sum(dim=1, keepdim=True) + 1e-8)
+                q_vec = q_flat[qi * w + qj].unsqueeze(0)   # [1, key_dim]
+
+                # L2 similarity (STCN):  S = dist^2 / sum_k dist^2
+                q2   = (q_vec * q_vec).sum(dim=1, keepdim=True)          # [1, 1]
+                k2   = (k_flat * k_flat).sum(dim=1).unsqueeze(0)         # [1, HW]
+                dot  = q_vec @ k_flat.T                                   # [1, HW]
+                dist = (q2 + k2 - 2.0 * dot).clamp_min(0.0)             # [1, HW]
+                S    = dist / (dist.sum(dim=1, keepdim=True) + 1e-8)    # [1, HW]
                 attn_maps[pi, vi] = S.reshape(h, w).cpu().numpy()
 
         self._attn_maps    = attn_maps
@@ -200,10 +180,10 @@ class AttentionLogger:
         if self._attn_maps is None:
             return
 
-        n_pts  = self._n_pts
-        n_vis  = self._n_vis
-        fig    = plt.figure(figsize=(3.5 * n_vis, 3.2 * n_pts + 0.6))
-        gs     = gridspec.GridSpec(
+        n_pts = self._n_pts
+        n_vis = self._n_vis
+        fig   = plt.figure(figsize=(3.5 * n_vis, 3.2 * n_pts + 0.6))
+        gs    = gridspec.GridSpec(
             n_pts, n_vis,
             figure=fig,
             hspace=0.35, wspace=0.08,
@@ -213,33 +193,35 @@ class AttentionLogger:
         vmin_global = float(np.percentile(self._attn_maps, 1))
         vmax_global = float(np.percentile(self._attn_maps, 99))
 
+        h, w = self._attn_maps.shape[2], self._attn_maps.shape[3]
+
         for pi in range(n_pts):
             for vi in range(n_vis):
                 ax = fig.add_subplot(gs[pi, vi])
-                # Background: BEV value magnitude (grey-ish context)
-                bev_norm = self._bev_maps[vi]
-                bev_norm = (bev_norm - bev_norm.min()) / (bev_norm.ptp() + 1e-8)
-                im = ax.imshow(
+
+                ax.imshow(
                     self._attn_maps[pi, vi],
                     cmap="coolwarm",
                     vmin=vmin_global, vmax=vmax_global,
                     interpolation="bilinear",
                     origin="upper",
                 )
-                # Draw grid lines (ReasonNet style)
-                h, w = self._attn_maps.shape[2], self._attn_maps.shape[3]
+
+                # Grid lines (ReasonNet style)
                 for gx in np.linspace(0, w, 5):
                     ax.axvline(gx, color="black", lw=0.5, alpha=0.4)
                 for gy in np.linspace(0, h, 5):
                     ax.axhline(gy, color="black", lw=0.5, alpha=0.4)
 
-                # Mark query location with a white cross
+                # White cross = query location (from current frame q_t)
                 qi, qj = self._query_pixels[pi]
                 ax.plot(qj, qi, "w+", markersize=8, markeredgewidth=1.5)
 
-                # Column title (only top row)
+                # Column title: actual temporal distance in frames
                 if pi == 0:
-                    ax.set_title(f"T − {vi + 1}", fontsize=10, pad=4)
+                    frames_ago = (vi + 1) * self.tau
+                    ax.set_title(f"T − {frames_ago}", fontsize=10, pad=4)
+
                 ax.axis("off")
 
         # Shared colorbar
@@ -281,7 +263,7 @@ def parse_args():
     p.add_argument("--vis_dir",        type=str,  default="./attn_vis",
                    help="Directory for attention visualization PNGs.")
     p.add_argument("--vis_n_hist",     type=int,  default=4,
-                   help="Number of past frames to visualize (T-1 ... T-n).")
+                   help="Number of past frames to visualize.")
     p.add_argument("--vis_n_pts",      type=int,  default=2,
                    help="Number of query locations (rows) per visualization.")
     p.add_argument("--set", dest="set_cfgs", default=None, nargs=argparse.REMAINDER)
@@ -297,7 +279,7 @@ def parse_args():
     if args.num_groups is None:
         args.num_groups = int(getattr(cfg.TRAIN, "SEQ_LEN", 4))
 
-    cfg.TAG           = Path(args.cfg_file).stem
+    cfg.TAG            = Path(args.cfg_file).stem
     cfg.EXP_GROUP_PATH = "/".join(args.cfg_file.split("/")[1:-1])
     return args
 
@@ -309,8 +291,8 @@ def parse_args():
 def main():
     args = parse_args()
 
-    root_dir       = getattr(cfg, "ROOT_DIR", Path.cwd())
-    output_dir     = Path(root_dir) / "output" / cfg.EXP_GROUP_PATH / cfg.TAG / args.extra_tag
+    root_dir        = getattr(cfg, "ROOT_DIR", Path.cwd())
+    output_dir      = Path(root_dir) / "output" / cfg.EXP_GROUP_PATH / cfg.TAG / args.extra_tag
     eval_output_dir = output_dir / "eval_sweep" / args.eval_tag
     eval_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -333,16 +315,13 @@ def main():
         training=False,
         logger=logger,
         seq_len=int(getattr(cfg.TRAIN, "SEQ_LEN", 4)),
-        stride=1,           # always 1 for eval — never subsample the val set
+        stride=1,
         nusc_version=cfg.DATA_CONFIG.VERSION,
         nusc_dataroot=cfg.DATA_CONFIG.DATA_PATH,
         root_path=None,
         sweep_stride=int(getattr(cfg.DATA_CONFIG, "SWEEP_STRIDE", 2)),
     )
 
-    # FIX: sanity-check that the sequence dataset and base dataset are aligned.
-    # len(test_set) should equal len(test_set.base) because each sequence maps
-    # to exactly one annotated keyframe.  Log a warning if not.
     if len(test_set) != len(test_set.base):
         logger.warning(
             f"[WARN] len(seq_dataset)={len(test_set)} != len(base_dataset)={len(test_set.base)}. "
@@ -381,6 +360,9 @@ def main():
     model.eval()
     logger.info("Model loaded and set to eval mode.")
 
+    # Read tau from bank config for correct column labels in visualisation
+    tau = int(getattr(model.bank, "tau", 2))
+
     # ------------------------------------------------------------------
     # Attention logger (optional)
     # ------------------------------------------------------------------
@@ -389,6 +371,7 @@ def main():
         save_dir=args.vis_dir,
         n_hist=args.vis_n_hist,
         max_query_pts=args.vis_n_pts,
+        tau=tau,
     ) if do_vis else None
 
     # ------------------------------------------------------------------
@@ -400,42 +383,32 @@ def main():
     with torch.no_grad():
         for sample_idx, seq in enumerate(test_loader):
 
-            # FIX: reset bank BEFORE forward so persistent GRU state from the
-            # previous sequence never leaks into this one.
-            # (forward() also calls bank.reset() internally as a safety net.)
+            # Reset bank BEFORE forward so state from previous sequence never leaks
             if hasattr(model, "reset_sequence"):
                 model.reset_sequence(sample_idx)
 
             frames      = seq["frames"]
             frames_list = [to_torch_batch_dict(f, device) for f in frames]
 
-            # FIX: correct return-value unpacking.
-            # Inference path of forward() returns: (final_box_dicts, {}, None)
-            # — exactly 3 values, and final_box_dicts IS the pred_dicts for
-            # generate_prediction_dicts (a list of per-batch-element dicts with
-            # 'pred_boxes', 'pred_scores', 'pred_labels').
-            pred_dicts, _recall_dicts, _ = model(
+            # forward() returns (pred_dicts, recall_dicts, dbg)
+            # dbg["q_t"] is the query_enc output for the current (keyframe) BEV —
+            # this is the correct query to use for attention visualisation.
+            pred_dicts, _recall_dicts, dbg = model(
                 frames_list=frames_list,
                 compute_det_loss=False,
             )
-            # pred_dicts: list[dict], len == batch_size == 1
 
             # ------------------------------------------------------------------
-            # FIX: map sequence index → base dataset index correctly.
-            # If NuScenesSeqDataset exposes a keyframe_indices list, use it.
-            # Otherwise fall back to sample_idx (valid only when 1:1 mapping holds).
+            # Map sequence index → base dataset index
             # ------------------------------------------------------------------
             if hasattr(test_set, "keyframe_indices"):
                 base_idx = int(test_set.keyframe_indices[sample_idx])
             else:
-                base_idx = sample_idx   # works when len(seq_set) == len(base_set)
+                base_idx = sample_idx
 
-            base_item     = test_set.base.__getitem__(base_idx)
+            base_item      = test_set.base.__getitem__(base_idx)
             base_batch_cpu = test_set.base.collate_batch([base_item])
 
-            # generate_prediction_dicts only uses metadata from base_batch_cpu
-            # (frame_id, lidar_path, etc.) and the prediction values from pred_dicts.
-            # It does NOT need spatial_features_2d from base_batch_cpu.
             annos = test_set.base.generate_prediction_dicts(
                 batch_dict=base_batch_cpu,
                 pred_dicts=pred_dicts,
@@ -445,18 +418,19 @@ def main():
             det_annos[sample_idx] = annos[0]
 
             # ------------------------------------------------------------------
-            # Attention visualization (every vis_interval sequences)
+            # Attention visualization
             # ------------------------------------------------------------------
             if do_vis and (sample_idx % args.vis_interval == 0):
                 try:
-                    # Reconstruct bev_list for the logger:
-                    # After forward() the frames_list entries [0..T-2] are set to None
-                    # (freed in the forward pass). We only have the keyframe BEV available
-                    # via model's bank._st_vals (stored after backbone).
-                    # We pass an empty list and let AttentionLogger use bank internal state.
+                    # q_t from dbg: the actual current-frame query [B, key_dim, H, W]
+                    # This is NEVER stored in the bank — it is the live query that
+                    # attends to all _st_keys[] which are the historical stored frames.
+                    q_t = dbg["q_t"]   # [1, key_dim, H, W]
+
                     attn_log.capture(
                         bank=model.bank,
                         pred_dicts=pred_dicts,
+                        q_t=q_t,
                     )
                     saved = attn_log.save(seq_idx=sample_idx)
                     if saved:

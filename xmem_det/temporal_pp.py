@@ -13,31 +13,6 @@ import matplotlib.pyplot as plt
 
 
 class TemporalPointPillar(PointPillar):
-    """
-    Temporal 3D detection pipeline combining:
-      - A pretrained PointPillar/CenterPoint backbone+head for per-frame detection
-      - A ReasonNetTemporalBank (ConvGRU + XMem-style memory) for temporal fusion
-
-    Architecture (TimePillars-style persistent GRU, NOT ReasonNet's stateless GRU):
-      - The ConvGRU hidden state _gru_h persists across real timesteps within a sequence
-      - The memory bank stores explicit key/value pairs for attention-based readout
-      - Both the persistent hidden state AND the bank provide temporal context
-
-    Per-sequence forward pass:
-      For each frame t in [sweep_0, sweep_1, ..., sweep_{N-1}, KEYFRAME]:
-        1) backbone(frame_t)  -> bev_t          [B, C, H, W]
-        2) bank.compute_mfused(bev_t) -> mfused_t  (GRU over history + current)
-        3) head(mfused_t, no_grad) -> mp_t      7-channel BEV map for bank conditioning
-        4) bank.update_bank(q_t, mfused_t, mp_t) -> stores new key/value pair
-
-      Only the final KEYFRAME contributes detection loss (it has gt_boxes).
-      Sweep frames build temporal memory but have no GT and no loss.
-
-    Training setup (phase 0):
-      - backbone_2d: FROZEN (pretrained weights, no gradient)
-      - dense_head:  trained (starts from pretrained, fine-tuned with temporal features)
-      - bank:        trained from scratch (query_enc, ConvGRU, value_enc)
-    """
 
     def __init__(self, model_cfg, num_class, dataset, pc_range, key_dim: int = 64, max_bank_frames: int = 8):
         super().__init__(model_cfg=model_cfg, num_class=num_class, dataset=dataset)
@@ -62,29 +37,6 @@ class TemporalPointPillar(PointPillar):
     # ------------------------------------------------------------------
 
     def _extract_mp_from_centerpoint(self, pred_dict: dict, H: int, W: int) -> torch.Tensor:
-        """
-        Convert one CenterPoint head's prediction dict into a 7-channel Mp map.
-
-        CenterPoint pred_dict keys:
-          'hm'     : [B, num_classes, H, W]  raw logits (need sigmoid)
-          'center' : [B, 2, H, W]            sub-voxel XY offset from grid center
-          'center_z': [B, 1, H, W]           Z coordinate
-          'dim'    : [B, 3, H, W]            log(l, w, h) — need exp()
-          'rot'    : [B, 2, H, W]            (cos θ, sin θ)
-          'vel'    : [B, 2, H, W]            (vx, vy) — optional
-
-        Output Mp channels:
-          [0] existence probability  (sigmoid of max heatmap logit)
-          [1] x sub-voxel offset
-          [2] y sub-voxel offset
-          [3] width  (exp of log(w))
-          [4] length (exp of log(l))
-          [5] heading angle (atan2 of sin/cos)
-          [6] velocity magnitude
-
-        Mp is used by the value encoder to condition what gets stored in the bank.
-        High-existence locations get prioritised in long-term memory selection.
-        """
         B = pred_dict['hm'].shape[0]
         device = pred_dict['hm'].device
         dtype = pred_dict['hm'].dtype
@@ -395,4 +347,4 @@ class TemporalPointPillar(PointPillar):
         final_box = frames_list[-1].get("final_box_dicts", None)
         if final_box is None:
             raise KeyError(f"final_box_dicts missing. keys={list(frames_list[-1].keys())}")
-        return final_box, {}, None
+        return final_box, {}, dbg_last

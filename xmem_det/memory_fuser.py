@@ -113,11 +113,6 @@ class ReasonNetValueEnc(nn.Module):
 
 class ReasonNetTemporalBank(nn.Module):
     """
-    XMem-style memory bank with a persistent ConvGRU hidden state.
-
-    This is a TimePillars-style architecture (persistent GRU state across real
-    timesteps), NOT ReasonNet's stateless GRU (which resets to zero each frame
-    and uses the GRU purely as a memory-slot aggregator).
 
     Two sources of temporal context per frame:
       1. _gru_h: ConvGRU hidden state that carries compressed history forward
@@ -131,9 +126,6 @@ class ReasonNetTemporalBank(nn.Module):
       Long-term buffer (_lt_*): sparse token set (promoted from short-term).
         Stores important/frequently-attended locations indefinitely.
         Capacity: tl frames × long_frame_tokens tokens each.
-
-    Bank is updated every `tau` steps to control memory usage.
-    At tau=2 on 10Hz data, we store one frame every ~0.2s.
     """
 
     def __init__(
@@ -518,22 +510,7 @@ class ReasonNetTemporalBank(nn.Module):
         mfused_t: torch.Tensor,   # [B, c_bev,   H, W] — fused features
         mp_t:     torch.Tensor,   # [B, 7,       H, W] — BEV map from head
     ) -> torch.Tensor:
-        """
-        Store a new key/value pair in the short-term memory bank.
-
-        Only runs every `tau` steps to limit memory usage and compute cost.
-        At tau=2 and 10Hz, this stores one frame every ~0.2 seconds.
-
-        Key   = q_t (the query encoder output — same space as stored keys,
-                so future queries can compare directly).
-        Value = value_enc(mfused_t, mp_t) — enriched with object geometry info.
-
-        Both are detached — the bank is a store of past information,
-        not part of the current step's computation graph.
-
-        When short-term buffer overflows (> ts frames), the oldest frame
-        is evicted, with important tokens promoted to long-term memory first.
-        """
+     
         self._step += 1
         if self.tau > 1 and (self._step % self.tau) != 0:
             # Not an update step — skip storing

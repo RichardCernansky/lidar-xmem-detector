@@ -58,3 +58,9 @@ Augmentations are disabled to preserve spatial consistency between sweep frames 
 Proper fix would be applying the same augmentation to the entire sequence (all sweeps + keyframe together), but this requires non-trivial changes to the OpenPCDet dataloader
 - gru Z swap form torch implementation - OK 
 - query enc - couple of conv layers
+- carla vs Nuscenes too dense?
+
+Your formula L2 - S = dist / sum(dist) gives higher weight to more dissimilar keys
+Reasonnet said they use STCN L2 but STCN uses softmax
+Your attention maps show the query attending to empty space rather than object locations
+These two observations are consistent with each other
