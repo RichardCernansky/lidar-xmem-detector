@@ -3,3 +3,4 @@ log/saved_ckpt/*.pth
 log/vis/
 Xmem/
 temporal_debug/
+attn_vis/

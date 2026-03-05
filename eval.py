@@ -1,17 +1,34 @@
+"""
+Evaluation script for TemporalPointPillar with ReasonNet memory bank.
+
+Based on the working ConvLSTM eval pipeline, adapted for:
+  - NuScenesSeqDataset (new dataset class with sweep sequences)
+  - Optional ReasonNet-style attention visualisation
+
+Usage:
+    python eval_temporal_sweep.py \
+        --cfg_file configs/temporal_pp_xmem_nuscenes.yaml \
+        --ckpt /path/to/checkpoint.pth \
+        --vis_interval 50
+
+Key correctness notes:
+  - stride=1 in NuScenesSeqDataset so sequence_indices[i] = i = kf_idx
+  - base_item fetched via test_set.base.__getitem__(sample_idx) so the
+    sample token matches predictions → correct nuScenes eval matching.
+"""
 
 import argparse
 import datetime
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import matplotlib
-matplotlib.use("Agg")                   # headless rendering
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_to_file
@@ -44,7 +61,7 @@ def to_torch_batch_dict(frame_dict: dict, device: torch.device) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Attention visualization
+# Attention visualization (optional)
 # ---------------------------------------------------------------------------
 
 class AttentionLogger:
@@ -70,54 +87,44 @@ class AttentionLogger:
         n_hist: int = 4,
         max_query_pts: int = 2,
         tau: int = 2,
-        q_chunk: int = 512,
     ):
         self.save_dir      = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.n_hist        = n_hist
         self.max_query_pts = max_query_pts
         self.tau           = tau
-        self.q_chunk       = q_chunk
 
-        self._attn_maps:    Optional[np.ndarray] = None   # [n_pts, n_vis, H, W]
-        self._bev_maps:     Optional[np.ndarray] = None   # [n_vis, H, W]
+        self._attn_maps:    Optional[np.ndarray] = None
+        self._bev_maps:     Optional[np.ndarray] = None
         self._n_vis:        int = 0
         self._n_pts:        int = 0
         self._query_pixels: list = []
-
-    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def capture(
         self,
         bank:       ReasonNetTemporalBank,
         pred_dicts: list,
-        q_t:        torch.Tensor,   # [B, key_dim, H, W] — current frame query from query_enc
+        q_t:        torch.Tensor,
     ):
         """
         Call AFTER forward().
 
         q_t  : the actual current-frame query (NOT stored in bank).
         bank : _st_keys contains only historical frames stored every tau steps.
-               _st_keys[-1] = most recent stored frame = T - tau
-               _st_keys[-2] = T - 2*tau
-               etc.
         """
         n_st = len(bank._st_keys)
         if n_st == 0:
             return
 
-        n_vis = min(n_st, self.n_hist)   # ALL stored frames are history
+        n_vis = min(n_st, self.n_hist)
 
         b, key_dim, h, w = q_t.shape
         hw = h * w
 
-        # Flatten current query
         q_flat = q_t[0].reshape(key_dim, hw).T   # [HW, key_dim]
 
-        # ------------------------------------------------------------------
         # Pick query pixel locations from top-scoring detections
-        # ------------------------------------------------------------------
         query_pixels = []
         if pred_dicts and "pred_scores" in pred_dicts[0]:
             scores = pred_dicts[0]["pred_scores"]
@@ -134,8 +141,7 @@ class AttentionLogger:
                     query_pixels.append((qi, qj))
 
         if not query_pixels:
-            # Fallback: highest-magnitude locations in current query map
-            mag      = q_t[0].abs().mean(0)   # [H, W]
+            mag      = q_t[0].abs().mean(0)
             flat_idx = mag.reshape(-1).topk(self.max_query_pts).indices
             for fi in flat_idx:
                 query_pixels.append((int(fi // w), int(fi % w)))
@@ -144,27 +150,21 @@ class AttentionLogger:
         attn_maps = np.zeros((n_pts, n_vis, h, w), dtype=np.float32)
         bev_maps  = np.zeros((n_vis, h, w),        dtype=np.float32)
 
-        # ------------------------------------------------------------------
-        # Compute attention: q_t vs each historical stored frame
-        # Iterate newest → oldest: _st_keys[-1]=T-tau, _st_keys[-2]=T-2*tau, ...
-        # ------------------------------------------------------------------
         for vi in range(n_vis):
-            st_idx = n_st - 1 - vi              # newest first
-            k_map  = bank._st_keys[st_idx]      # [1, key_dim, H, W]
-            k_flat = k_map[0].reshape(key_dim, hw).T   # [HW, key_dim]
+            st_idx = n_st - 1 - vi
+            k_map  = bank._st_keys[st_idx]
+            k_flat = k_map[0].reshape(key_dim, hw).T
 
-            # BEV context from stored values (for background in save())
             bev_maps[vi] = bank._st_vals[st_idx][0].abs().mean(0).cpu().numpy()
 
             for pi, (qi, qj) in enumerate(query_pixels):
-                q_vec = q_flat[qi * w + qj].unsqueeze(0)   # [1, key_dim]
+                q_vec = q_flat[qi * w + qj].unsqueeze(0)
 
-                # L2 similarity (STCN):  S = dist^2 / sum_k dist^2
-                q2   = (q_vec * q_vec).sum(dim=1, keepdim=True)          # [1, 1]
-                k2   = (k_flat * k_flat).sum(dim=1).unsqueeze(0)         # [1, HW]
-                dot  = q_vec @ k_flat.T                                   # [1, HW]
-                dist = (q2 + k2 - 2.0 * dot).clamp_min(0.0)             # [1, HW]
-                S    = dist / (dist.sum(dim=1, keepdim=True) + 1e-8)    # [1, HW]
+                q2   = (q_vec * q_vec).sum(dim=1, keepdim=True)
+                k2   = (k_flat * k_flat).sum(dim=1).unsqueeze(0)
+                dot  = q_vec @ k_flat.T
+                dist = (q2 + k2 - 2.0 * dot).clamp_min(0.0)
+                S    = dist / (dist.sum(dim=1, keepdim=True) + 1e-8)
                 attn_maps[pi, vi] = S.reshape(h, w).cpu().numpy()
 
         self._attn_maps    = attn_maps
@@ -173,12 +173,10 @@ class AttentionLogger:
         self._n_pts        = n_pts
         self._query_pixels = query_pixels
 
-    # ------------------------------------------------------------------
-
     def save(self, seq_idx: int, tag: str = ""):
         """Render and save a ReasonNet-style attention grid."""
         if self._attn_maps is None:
-            return
+            return None
 
         n_pts = self._n_pts
         n_vis = self._n_vis
@@ -198,7 +196,6 @@ class AttentionLogger:
         for pi in range(n_pts):
             for vi in range(n_vis):
                 ax = fig.add_subplot(gs[pi, vi])
-
                 ax.imshow(
                     self._attn_maps[pi, vi],
                     cmap="coolwarm",
@@ -206,25 +203,19 @@ class AttentionLogger:
                     interpolation="bilinear",
                     origin="upper",
                 )
-
-                # Grid lines (ReasonNet style)
                 for gx in np.linspace(0, w, 5):
                     ax.axvline(gx, color="black", lw=0.5, alpha=0.4)
                 for gy in np.linspace(0, h, 5):
                     ax.axhline(gy, color="black", lw=0.5, alpha=0.4)
 
-                # White cross = query location (from current frame q_t)
                 qi, qj = self._query_pixels[pi]
                 ax.plot(qj, qi, "w+", markersize=8, markeredgewidth=1.5)
 
-                # Column title: actual temporal distance in frames
                 if pi == 0:
                     frames_ago = (vi + 1) * self.tau
                     ax.set_title(f"T − {frames_ago}", fontsize=10, pad=4)
-
                 ax.axis("off")
 
-        # Shared colorbar
         cbar_ax = fig.add_axes([0.90, 0.10, 0.025, 0.75])
         sm = plt.cm.ScalarMappable(
             cmap="coolwarm",
@@ -253,19 +244,17 @@ def parse_args():
     p.add_argument("--ckpt",           type=str,  required=True)
     p.add_argument("--workers",        type=int,  default=4)
     p.add_argument("--split",          type=str,  default=None)
-    p.add_argument("--num_groups",     type=int,  default=None,
-                   help="Sweep groups per keyframe. Defaults to TRAIN.SEQ_LEN.")
     p.add_argument("--extra_tag",      type=str,  default="default")
     p.add_argument("--eval_tag",       type=str,  default="sweep_eval")
     p.add_argument("--log_interval",   type=int,  default=50)
+
+    # Attention vis options
     p.add_argument("--vis_interval",   type=int,  default=50,
-                   help="Save attention visualization every N sequences (0 = disable).")
-    p.add_argument("--vis_dir",        type=str,  default="./attn_vis",
-                   help="Directory for attention visualization PNGs.")
-    p.add_argument("--vis_n_hist",     type=int,  default=4,
-                   help="Number of past frames to visualize.")
-    p.add_argument("--vis_n_pts",      type=int,  default=2,
-                   help="Number of query locations (rows) per visualization.")
+                   help="Save attention vis every N sequences (0 = disable).")
+    p.add_argument("--vis_dir",        type=str,  default="./attn_vis")
+    p.add_argument("--vis_n_hist",     type=int,  default=4)
+    p.add_argument("--vis_n_pts",      type=int,  default=2)
+
     p.add_argument("--set", dest="set_cfgs", default=None, nargs=argparse.REMAINDER)
     args = p.parse_args()
 
@@ -275,9 +264,6 @@ def parse_args():
 
     if args.split is not None:
         cfg.DATA_CONFIG.DATA_SPLIT["test"] = args.split
-
-    if args.num_groups is None:
-        args.num_groups = int(getattr(cfg.TRAIN, "SEQ_LEN", 4))
 
     cfg.TAG            = Path(args.cfg_file).stem
     cfg.EXP_GROUP_PATH = "/".join(args.cfg_file.split("/")[1:-1])
@@ -303,30 +289,33 @@ def main():
     logger.info(f"cfg_file={args.cfg_file}")
     logger.info(f"ckpt={args.ckpt}")
     logger.info(f"split={cfg.DATA_CONFIG.DATA_SPLIT['test']}")
-    logger.info(f"num_groups={args.num_groups}")
     log_config_to_file(cfg, logger=logger)
 
     # ------------------------------------------------------------------
-    # Dataset
+    # Dataset — stride=1 is critical so sequence_indices[i] == i
     # ------------------------------------------------------------------
+    seq_len      = int(getattr(cfg.TRAIN, "SEQ_LEN", 4))
+    sweep_stride = int(getattr(cfg.DATA_CONFIG, "SWEEP_STRIDE", 2))
+
     test_set = NuScenesSeqDataset(
         dataset_cfg=cfg.DATA_CONFIG,
         class_names=cfg.CLASS_NAMES,
         training=False,
         logger=logger,
-        seq_len=int(getattr(cfg.TRAIN, "SEQ_LEN", 4)),
-        stride=1,
+        seq_len=seq_len,
+        stride=1,                               # MUST be 1 for eval
         nusc_version=cfg.DATA_CONFIG.VERSION,
         nusc_dataroot=cfg.DATA_CONFIG.DATA_PATH,
         root_path=None,
-        sweep_stride=int(getattr(cfg.DATA_CONFIG, "SWEEP_STRIDE", 2)),
+        sweep_stride=sweep_stride,
     )
 
-    if len(test_set) != len(test_set.base):
-        logger.warning(
-            f"[WARN] len(seq_dataset)={len(test_set)} != len(base_dataset)={len(test_set.base)}. "
-            "base_item lookup by sample_idx may be wrong — check NuScenesSeqDataset.keyframe_indices."
-        )
+    # Sanity: with stride=1, seq dataset length must equal base dataset length
+    assert len(test_set) == len(test_set.base), (
+        f"Dataset length mismatch: seq={len(test_set)} vs base={len(test_set.base)}. "
+        f"stride must be 1 for evaluation so sample_idx maps directly to kf_idx."
+    )
+    logger.info(f"Dataset: {len(test_set)} sequences, seq_len={seq_len}, sweep_stride={sweep_stride}")
 
     test_loader = DataLoader(
         test_set,
@@ -353,14 +342,14 @@ def main():
     state = blob["model_state"] if isinstance(blob, dict) and "model_state" in blob else blob
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:
-        logger.warning(f"Missing keys ({len(missing)}): {missing[:5]}{'...' if len(missing)>5 else ''}")
+        logger.warning(f"Missing keys ({len(missing)}): {missing[:10]}{'...' if len(missing) > 10 else ''}")
     if unexpected:
-        logger.warning(f"Unexpected keys ({len(unexpected)}): {unexpected[:5]}{'...' if len(unexpected)>5 else ''}")
+        logger.warning(f"Unexpected keys ({len(unexpected)}): {unexpected[:10]}{'...' if len(unexpected) > 10 else ''}")
 
     model.eval()
     logger.info("Model loaded and set to eval mode.")
 
-    # Read tau from bank config for correct column labels in visualisation
+    # Read tau from bank config for correct column labels in vis
     tau = int(getattr(model.bank, "tau", 2))
 
     # ------------------------------------------------------------------
@@ -383,7 +372,7 @@ def main():
     with torch.no_grad():
         for sample_idx, seq in enumerate(test_loader):
 
-            # Reset bank BEFORE forward so state from previous sequence never leaks
+            # Reset bank before each sequence
             if hasattr(model, "reset_sequence"):
                 model.reset_sequence(sample_idx)
 
@@ -391,22 +380,29 @@ def main():
             frames_list = [to_torch_batch_dict(f, device) for f in frames]
 
             # forward() returns (pred_dicts, recall_dicts, dbg)
-            # dbg["q_t"] is the query_enc output for the current (keyframe) BEV —
-            # this is the correct query to use for attention visualisation.
-            pred_dicts, _recall_dicts, dbg = model(
+            pred_dicts, recall_dicts, dbg = model(
                 frames_list=frames_list,
                 compute_det_loss=False,
             )
 
             # ------------------------------------------------------------------
-            # Map sequence index → base dataset index
+            # Diagnostic logging for first few sequences
             # ------------------------------------------------------------------
-            if hasattr(test_set, "keyframe_indices"):
-                base_idx = int(test_set.keyframe_indices[sample_idx])
-            else:
-                base_idx = sample_idx
+            if sample_idx < 3:
+                n_dets = len(pred_dicts[0]["pred_scores"]) if pred_dicts else 0
+                max_score = float(pred_dicts[0]["pred_scores"].max()) if n_dets > 0 else 0.0
+                logger.info(
+                    f"[DBG] seq {sample_idx}: n_dets={n_dets}, "
+                    f"max_score={max_score:.3f}, "
+                    f"seq_token={seq.get('sample_token', 'N/A')}"
+                )
 
-            base_item      = test_set.base.__getitem__(base_idx)
+            # ------------------------------------------------------------------
+            # Generate prediction annotations
+            # Uses sample_idx directly — correct because stride=1 guarantees
+            # sequence_indices[sample_idx] == sample_idx == kf_idx
+            # ------------------------------------------------------------------
+            base_item      = test_set.base.__getitem__(sample_idx)
             base_batch_cpu = test_set.base.collate_batch([base_item])
 
             annos = test_set.base.generate_prediction_dicts(
@@ -418,15 +414,11 @@ def main():
             det_annos[sample_idx] = annos[0]
 
             # ------------------------------------------------------------------
-            # Attention visualization
+            # Attention visualization (optional)
             # ------------------------------------------------------------------
-            if do_vis and (sample_idx % args.vis_interval == 0):
+            if do_vis and (sample_idx % args.vis_interval == 0) and dbg is not None:
                 try:
-                    # q_t from dbg: the actual current-frame query [B, key_dim, H, W]
-                    # This is NEVER stored in the bank — it is the live query that
-                    # attends to all _st_keys[] which are the historical stored frames.
-                    q_t = dbg["q_t"]   # [1, key_dim, H, W]
-
+                    q_t = dbg["q_t"]
                     attn_log.capture(
                         bank=model.bank,
                         pred_dicts=pred_dicts,
