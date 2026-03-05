@@ -289,11 +289,14 @@ class TemporalPointPillar(PointPillar):
             if do_viz:
                 bank_state = self.bank.get_debug_state()
                 bank_maps  = self.bank.get_debug_maps(batch_idx=0)
+                mem_kinds  = dbg_t["mem_kinds"]   # fix: was `mem_kinds` undefined
                 debugger.log_timestep(
-                    t=t, bev_t=bev_t, mfused_t=mfused_t, mp_t=mp_t,
-                    bank_state=bank_state, bank_maps=bank_maps,
-                    mem_kinds=dbg_t["mem_kinds"], batch_idx=0
-                )
+                    t, bev_t, mfused_t, mp_t,
+                    bank_state, bank_maps, mem_kinds,
+                    q_t=dbg_t["q_t"],              # fix: was `dbg["q_t"]`, should be `dbg_t`
+                    st_keys=self.bank._st_keys,    # fix: was `bank._st_keys`, should be `self.bank`
+                    batch_idx=0
+            )
             
             # Explicitly free early frame BEV — no longer needed
             if t < T - 1:

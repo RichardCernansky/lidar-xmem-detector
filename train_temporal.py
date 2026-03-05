@@ -492,6 +492,7 @@ def main():
         model.load_state_dict(state, strict=False)
         logger.info(f"Loaded pretrained PP from {pretrained_pp_ckpt}")
     
+        # LOAD HEAD FROM SCRATCH
         # ckpt = torch.load(str(pretrained_pp_ckpt), map_location="cpu")
         # state = ckpt["model_state"] if "model_state" in ckpt else ckpt
         

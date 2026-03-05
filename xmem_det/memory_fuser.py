@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+#TODO LT Fix : ST usage index bug in compute_mfused
 
 # ---------------------------------------------------------------------------
 # ConvGRU cell
@@ -352,6 +353,10 @@ class ReasonNetTemporalBank(nn.Module):
         L2 similarity (from STCN) is more stable than dot-product attention
         because it doesn't require normalisation of key/query magnitudes.
         """
+        # ADD FOR STCN 
+        q_blk = nn.functional.normalize(q_blk, dim=2)  # [B, chunk, key_dim]
+        k_all = nn.functional.normalize(k_all, dim=2)  # [B, M,     key_dim]
+
         q2  = (q_blk * q_blk).sum(dim=2, keepdim=True)   # [B, chunk, 1]
         k2  = (k_all * k_all).sum(dim=2).unsqueeze(1)     # [B, 1,     M]
         dot = torch.bmm(q_blk, k_all.transpose(1, 2))     # [B, chunk, M]
@@ -388,8 +393,9 @@ class ReasonNetTemporalBank(nn.Module):
             e     = min(s + step, hw_q)
             q_blk = q_flat[:, s:e, :]                           # [B, chunk, key_dim]
             dist  = self._dist_sq_block(q_blk, k_flat)          # [B, chunk, M]
-            denom = dist.sum(dim=2, keepdim=True).add(1e-8)     # [B, chunk, 1]
-            S     = dist / denom                                 # [B, chunk, M] normalised
+            # denom = dist.sum(dim=2, keepdim=True).add(1e-8)     # [B, chunk, 1]
+            # S     = dist / denom                                 # [B, chunk, M] normalised
+            S = torch.softmax(-dist, dim=2) # actual STCN approach
             out_blocks.append(torch.bmm(S, v_flat))             # [B, chunk, c_bev]
             usage_blocks.append(S.detach().sum(dim=1))          # [B, M] — detached, no grad needed
 
