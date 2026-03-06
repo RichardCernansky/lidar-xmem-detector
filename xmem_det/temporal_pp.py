@@ -26,6 +26,7 @@ class TemporalPointPillar(PointPillar):
 
         self.debug_last = {}
         self.vis_counter = 0
+        # self.eval_vis_dir: str = None   # set to a path to enable vis during eval
 
     def reset_sequence(self, seq_id: int):
         # Called between sequences to clear GRU hidden state and memory bank.
@@ -253,15 +254,13 @@ class TemporalPointPillar(PointPillar):
         dbg_last    = None
         mp_last     = None
 
-        # Optional per-sequence visualisation (every 50 sequences during training)
-        do_viz  = self.training and (self.vis_counter % 50 == 0)
-        debugger = None
+        # Training: visualize every 50 steps. Eval: visualize if eval_vis_dir is set.
+        _eval_vis = not self.training and self.eval_vis_dir is not None
+        do_viz    = (self.training and (self.vis_counter % 50 == 0)) or _eval_vis
+        debugger  = None
         if do_viz:
-            debugger = TemporalDebugger(
-                save_dir="./temporal_debug",
-                log_every=1,
-                max_batches=1
-            )
+            save_dir = self.eval_vis_dir if _eval_vis else "./temporal_debug"
+            debugger = TemporalDebugger(save_dir=save_dir, log_every=1, max_batches=1)
             debugger.start_sequence(seq_name=f"seq{self.vis_counter:03d}")
 
         # ------------------------------------------------------------------
@@ -283,6 +282,10 @@ class TemporalPointPillar(PointPillar):
             # Immediately fuse and update bank
             # bev_t from early frames can be freed after bank.update_bank()
             mfused_t, dbg_t = self.bank.compute_mfused(bev_t)
+
+            #DEBUG
+            # mfused_t = bev_t
+
             mp_t = self._get_mp_from_head_nograd(frames_list[t], mfused_t)
             self.bank.update_bank(dbg_t["q_t"], mfused_t, mp_t)
 
@@ -309,7 +312,7 @@ class TemporalPointPillar(PointPillar):
                 mp_last = mp_t
 
         
-        if do_viz:
+        if do_viz and debugger is not None:
             debugger.finish_sequence()
         self.vis_counter += 1
 

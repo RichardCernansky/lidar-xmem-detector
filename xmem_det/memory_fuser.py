@@ -498,7 +498,8 @@ class ReasonNetTemporalBank(nn.Module):
         # Step 6: normalise and return.
         # mfused_t uses the ORIGINAL h_t (not detached) so gradients from loss
         # flow back through this step's GRU calls into bev_t and GRU weights.
-        mfused_t = self.gru_output_norm(h_t)   # [B, c_bev, H, W]
+        # mfused_t = bev_t + self.gru_output_norm(h_t)  # [B, c_bev, H, W]
+        mfused_t = self.gru_output_norm(h_t)  # [B, c_bev, H, W]
 
         dbg = {
             "q_t":       q_t,

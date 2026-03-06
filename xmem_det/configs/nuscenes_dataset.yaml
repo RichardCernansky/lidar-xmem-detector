@@ -1,7 +1,7 @@
 DATASET: 'NuScenesDataset'
 DATA_PATH: '/home/cernanskyr/OpenPCDet/data/nuscenes'
 
-VERSION: 'v1.0-trainval'
+VERSION: 'v1.0-mini'
 MAX_SWEEPS: 10  #irrelevant for sequential processing of one sweep agg
 PRED_VELOCITY: True
 SET_NAN_VELOCITY_TO_ZEROS: True
