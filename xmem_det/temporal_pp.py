@@ -23,6 +23,7 @@ class TemporalPointPillar(PointPillar):
         # c_bev: number of BEV feature channels output by backbone_2d (e.g. 384 for BaseBEVBackbone)
         self.c_bev = int(self.backbone_2d.num_bev_features)
         self.bank = ReasonNetTemporalBank(c_bev=self.c_bev, key_dim=int(key_dim))
+        
 
         self.debug_last = {}
         self.vis_counter = 0
@@ -292,14 +293,20 @@ class TemporalPointPillar(PointPillar):
             if do_viz:
                 bank_state = self.bank.get_debug_state()
                 bank_maps  = self.bank.get_debug_maps(batch_idx=0)
-                mem_kinds  = dbg_t["mem_kinds"]   # fix: was `mem_kinds` undefined
+                mem_kinds  = dbg_t["mem_kinds"]
+
+                # Extract GT boxes — only present on the keyframe (t == T-1)
+                gt_boxes_np = TemporalDebugger.extract_gt_boxes(bd, batch_idx=0)
+
                 debugger.log_timestep(
                     t, bev_t, mfused_t, mp_t,
                     bank_state, bank_maps, mem_kinds,
-                    q_t=dbg_t["q_t"],              # fix: was `dbg["q_t"]`, should be `dbg_t`
-                    st_keys=self.bank._st_keys,    # fix: was `bank._st_keys`, should be `self.bank`
-                    batch_idx=0
-            )
+                    q_t=dbg_t["q_t"],
+                    st_keys=self.bank._st_keys,
+                    batch_idx=0,
+                    gt_boxes=gt_boxes_np,       # None for sweep frames, [N,8] for keyframe
+                    pc_range=self.pc_range,
+                )
             
             # Explicitly free early frame BEV — no longer needed
             if t < T - 1:
@@ -324,6 +331,13 @@ class TemporalPointPillar(PointPillar):
         # ------------------------------------------------------------------
         frames_list[-1]["spatial_features_2d"] = mfused_last
         frames_list[-1] = self.dense_head(frames_list[-1])
+
+        # After Step 4
+        print("ahoj")
+        final_box = frames_list[-1].get("final_box_dicts", None)
+        if final_box:
+            scores = final_box[0]['pred_scores']
+            print(f"n_dets={len(scores)}, max_score={scores.max():.3f}, min_score={scores.min():.3f}")
 
         # ------------------------------------------------------------------
         # Step 5: Loss or prediction output.

@@ -23,10 +23,10 @@ ADDONS:
     CKPT_DIR: "log/ckpt"
 
     # either one of RESUME_CKPT and PRETRAINED_PP_CKPT can be set to non-null
-    # RESUME_CKPT: "log/ckpt/phase0_10hz_epoch_1_seq22000.pth"
-    RESUME_CKPT: null
-    # PRETRAINED_PP_CKPT: null
-    PRETRAINED_PP_CKPT: "/home/cernanskyr/OpenPCDet/output/cfgs/nuscenes_models/cbgs_dyn_pp_centerpoint/dynpp_centerpoint_pretrain/ckpt/checkpoint_epoch_20.pth"
+    RESUME_CKPT: "log/ckpt/phase0_10hz_epoch_4.pth"
+    # RESUME_CKPT: null
+    PRETRAINED_PP_CKPT: null
+    # PRETRAINED_PP_CKPT: "/home/cernanskyr/OpenPCDet/output/cfgs/nuscenes_models/cbgs_dyn_pp_centerpoint/dynpp_centerpoint_pretrain/ckpt/checkpoint_epoch_20.pth"
 
     USE_CKPT_EPOCH: true
     RESUME_OPTIM_SCHED: false 
@@ -54,8 +54,8 @@ ADDONS:
     "0":
       PREFIXES: ["bank", "dense_head"]
 
-      START_EPOCH: 0
-      END_EPOCH: 3
+      START_EPOCH: 5 
+      END_EPOCH: 10
 
       LR_START: 3e-5
       LR_MAX: 3e-5
@@ -261,7 +261,7 @@ MODEL:
             }
 
         POST_PROCESSING:
-            SCORE_THRESH: 0.1
+            SCORE_THRESH: 0.1 
             POST_CENTER_LIMIT_RANGE: [-61.2, -61.2, -10.0, 61.2, 61.2, 10.0]
             MAX_OBJ_PER_SAMPLE: 500
             NMS_CONFIG:
@@ -273,7 +273,7 @@ MODEL:
     POST_PROCESSING:
         RECALL_THRESH_LIST: [0.3, 0.5, 0.7]
 
-        EVAL_METRIC: kitti
+        EVAL_METRIC: nuscenes 
 
 
 OPTIMIZATION:

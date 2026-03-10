@@ -64,3 +64,14 @@ Your formula L2 - S = dist / sum(dist) gives higher weight to more dissimilar ke
 Reasonnet said they use STCN L2 but STCN uses softmax
 Your attention maps show the query attending to empty space rather than object locations
 These two observations are consistent with each other
+
+
+8.3.
+- gru fusion with bev_? normalized with parameter?
+
+The problem you're hitting is not that L2 is wrong for your use case — it's that your query encoder outputs have large unconstrained magnitudes making L2 distances explode at initialisation. STCN doesn't have this problem because their key encoder is trained from scratch on ImageNet features that happen to be well-scaled.
+The real fix is to normalise the keys at write time AND queries at read time (making it cosine) but use a learnable temperature instead of the hardcoded 0.01:
+pythonself.attn_temp = nn.Parameter(torch.tensor(0.1))  # learnable temperature
+
+S = torch.bmm(q_blk, k_flat_n.T) / self.attn_temp.clamp(min=0.01)
+This gives the model freedom to find the right scale rather than you hardcoding it.

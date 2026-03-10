@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 #TODO LT Fix : ST usage index bug in compute_mfused
 
@@ -155,6 +156,7 @@ class ReasonNetTemporalBank(nn.Module):
         self.max_from_discard  = int(max_from_discard)
         self.q_chunk           = int(q_chunk)
 
+        self.gru_scale = nn.Parameter(torch.zeros(1))       
         # Query encoder: projects BEV features to a lower-dim key space.
         # Keys are in R^key_dim, values stay in R^c_bev.
         # Smaller key_dim reduces attention computation cost.
@@ -341,66 +343,25 @@ class ReasonNetTemporalBank(nn.Module):
 
     # -------- Memory read ----------------------------------
 
-    def _dist_sq_block(self, q_blk: torch.Tensor, k_all: torch.Tensor) -> torch.Tensor:
-        """
-        Compute squared L2 distance between query block and all keys.
-        ||q - k||^2 = ||q||^2 + ||k||^2 - 2 q·k^T
-
-        q_blk: [B, chunk, key_dim]
-        k_all: [B, M,     key_dim]
-        returns: [B, chunk, M]  (squared distances)
-
-        L2 similarity (from STCN) is more stable than dot-product attention
-        because it doesn't require normalisation of key/query magnitudes.
-        """
-        # ADD FOR STCN 
-        q_blk = nn.functional.normalize(q_blk, dim=2)  # [B, chunk, key_dim]
-        k_all = nn.functional.normalize(k_all, dim=2)  # [B, M,     key_dim]
-
-        q2  = (q_blk * q_blk).sum(dim=2, keepdim=True)   # [B, chunk, 1]
-        k2  = (k_all * k_all).sum(dim=2).unsqueeze(1)     # [B, 1,     M]
-        dot = torch.bmm(q_blk, k_all.transpose(1, 2))     # [B, chunk, M]
-        return (q2 + k2 - 2.0 * dot).clamp_min(0.0)
-
-    def _read_one_memory(
-        self,
-        q_flat: torch.Tensor,   # [B, HW, key_dim]
-        k_flat: torch.Tensor,   # [B, M,  key_dim]
-        v_flat: torch.Tensor,   # [B, M,  c_bev]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Attention-based readout from one memory frame.
-
-        Similarity S(q, k) = dist(q, k)^2 / sum_k dist(q, k)^2
-        This is the STCN L2 softmax: nearby keys get high weight,
-        but the denominator normalises over the spatial extent of the memory.
-
-        Chunked over query positions to avoid a full [B, HW, M] attention matrix
-        in memory (HW can be 512×512/4 = 65536 for full BEV grid).
-
-        Returns:
-          out:   [B, HW, c_bev]  — attended value readout
-          usage: [B, M]          — cumulative attention weight per memory token
-                                   (used for LT promotion selection)
-        """
+    def _read_one_memory(self, q_flat, k_flat, v_flat):
+        # q_flat: [B, HW, key_dim] — NOT normalised
+        # k_flat: [B, M,  key_dim] — NOT normalised
         b, hw_q, _ = q_flat.shape
         step = self.q_chunk if self.q_chunk > 0 else hw_q
 
-        out_blocks:   List[torch.Tensor] = []
-        usage_blocks: List[torch.Tensor] = []
-
+        out_blocks, usage_blocks = [], []
         for s in range(0, hw_q, step):
             e     = min(s + step, hw_q)
-            q_blk = q_flat[:, s:e, :]                           # [B, chunk, key_dim]
-            dist  = self._dist_sq_block(q_blk, k_flat)          # [B, chunk, M]
-            # denom = dist.sum(dim=2, keepdim=True).add(1e-8)     # [B, chunk, 1]
-            # S     = dist / denom                                 # [B, chunk, M] normalised
-            S = torch.softmax(-dist, dim=2) # actual STCN approach
-            out_blocks.append(torch.bmm(S, v_flat))             # [B, chunk, c_bev]
-            usage_blocks.append(S.detach().sum(dim=1))          # [B, M] — detached, no grad needed
+            q_blk = q_flat[:, s:e, :]                              # [B, chunk, key_dim]
+            ab    = torch.bmm(k_flat, q_blk.transpose(1, 2))       # [B, M, chunk]
+            a_sq  = (k_flat * k_flat).sum(dim=2, keepdim=True)     # [B, M, 1]
+            S     = (2 * ab - a_sq).transpose(1, 2)                # [B, chunk, M]
+            W     = torch.softmax(S, dim=2)
+            out_blocks.append(torch.bmm(W, v_flat))
+            usage_blocks.append(W.detach().sum(dim=1))
 
-        out   = torch.cat(out_blocks, dim=1)                    # [B, HW, c_bev]
-        usage = torch.stack(usage_blocks, dim=0).sum(dim=0)    # [B, M]
+        out   = torch.cat(out_blocks, dim=1)
+        usage = torch.stack(usage_blocks, dim=0).sum(dim=0)
         return out, usage
 
     def _collect_memory(self) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[str]]:
@@ -456,7 +417,7 @@ class ReasonNetTemporalBank(nn.Module):
         # Step 2: encode bev_t to query [B, key_dim, H, W]
         q_t    = self.query_enc(bev_t)                                    # [B, key_dim, H, W]
         hw     = h * w
-        q_flat = q_t.reshape(b, self.key_dim, hw).permute(0, 2, 1)       # [B, HW, key_dim]
+        q_flat = q_t.reshape(b, self.key_dim, hw).permute(0, 2, 1)
 
         # Step 3: read from all stored memory frames
         mem_keys, mem_vals, mem_kinds = self._collect_memory()
@@ -498,8 +459,10 @@ class ReasonNetTemporalBank(nn.Module):
         # Step 6: normalise and return.
         # mfused_t uses the ORIGINAL h_t (not detached) so gradients from loss
         # flow back through this step's GRU calls into bev_t and GRU weights.
-        # mfused_t = bev_t + self.gru_output_norm(h_t)  # [B, c_bev, H, W]
+
         mfused_t = self.gru_output_norm(h_t)  # [B, c_bev, H, W]
+        # mfused_t = bev_t + self.gru_output_norm(h_t)  # [B, c_bev, H, W]
+        # mfused_t = bev_t + torch.sigmoid(self.gru_scale) * self.gru_output_norm(h_t)
 
         dbg = {
             "q_t":       q_t,
@@ -526,8 +489,8 @@ class ReasonNetTemporalBank(nn.Module):
         # Detach everything stored in the bank — these tensors must not be
         # part of the gradient graph (they'd be reused across sequence steps
         # and cause incorrect cross-step gradients).
-        k_t  = q_t.detach()                               # [B, key_dim, H, W]
-        v_t  = self.value_enc(mfused_t, mp_t).detach()   # [B, c_bev,   H, W]
+        k_t = q_t.detach()
+        v_t = self.value_enc(mfused_t, mp_t).detach()  # [B, c_bev,   H, W]
         mp0  = mp_t[:, 0:1].detach()                      # [B, 1, H, W] existence channel only
 
         b, _, h_k, w_k = k_t.shape

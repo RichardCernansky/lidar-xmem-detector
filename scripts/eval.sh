@@ -13,5 +13,5 @@
 
 python eval.py \
     --cfg_file xmem_det/configs/temporal_pp_xmem_nuscenes.yaml \
-     --ckpt /home/cernanskyr/OpenPCDet/output/cfgs/nuscenes_models/cbgs_dyn_pp_centerpoint/dynpp_centerpoint_pretrain/ckpt/checkpoint_epoch_20.pth \
+     --ckpt log/ckpt/phase0_10hz_epoch_9_seq14000.pth \
     --vis_dir ./eval_vis

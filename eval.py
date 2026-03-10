@@ -172,6 +172,13 @@ def main():
             base_item      = test_set.base.__getitem__(sample_idx)
             base_batch_cpu = test_set.base.collate_batch([base_item])
 
+            base_token = base_item.get('metadata', {}).get('token', 
+            base_item.get('sample_token', 'MISSING'))
+            seq_token  = seq.get('sample_token', 'MISSING')
+            if sample_idx < 5:
+                match = "✓ MATCH" if base_token == seq_token else "✗ MISMATCH ←←← BUG"
+                print(f"[{sample_idx}] seq_token={seq_token}  base_token={base_token}  {match}")
+
             annos = test_set.base.generate_prediction_dicts(
                 batch_dict=base_batch_cpu,
                 pred_dicts=pred_dicts,

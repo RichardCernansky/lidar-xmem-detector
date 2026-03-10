@@ -102,7 +102,7 @@ class NuScenesSeqDataset(Dataset):
         self.base.training = was_training
 
         frames.append(self.base.collate_batch([kf_raw]))
-        print(len(frames))
+        
         return {
             "frames"      : frames,
             "sample_token": info["token"],
