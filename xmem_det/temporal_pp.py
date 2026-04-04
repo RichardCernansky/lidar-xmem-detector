@@ -27,7 +27,7 @@ class TemporalPointPillar(PointPillar):
 
         self.debug_last = {}
         self.vis_counter = 0
-        # self.eval_vis_dir: str = None   # set to a path to enable vis during eval
+        self.eval_vis_dir: str = None   # set to a path to enable vis during eval
 
     def reset_sequence(self, seq_id: int):
         # Called between sequences to clear GRU hidden state and memory bank.
@@ -264,15 +264,14 @@ class TemporalPointPillar(PointPillar):
             debugger = TemporalDebugger(save_dir=save_dir, log_every=1, max_batches=1)
             debugger.start_sequence(seq_name=f"seq{self.vis_counter:03d}")
 
-        # ------------------------------------------------------------------
-        # Step 3: Temporal reasoning loop — oldest frame to newest (keyframe).
+# ------------------------------------------------------------------
+        # Step 3: Temporal reasoning loop
         # ------------------------------------------------------------------
         self.bank.reset()
 
         for t in range(T):
             bd = frames_list[t]
             
-            # Run backbone for this frame only
             for cur_module in self.module_list:
                 if cur_module is self.dense_head:
                     break
@@ -280,64 +279,66 @@ class TemporalPointPillar(PointPillar):
             frames_list[t] = bd
             bev_t = bd["spatial_features_2d"]
             
-            # Immediately fuse and update bank
-            # bev_t from early frames can be freed after bank.update_bank()
             mfused_t, dbg_t = self.bank.compute_mfused(bev_t)
-
-            #DEBUG
-            # mfused_t = bev_t
-
             mp_t = self._get_mp_from_head_nograd(frames_list[t], mfused_t)
             self.bank.update_bank(dbg_t["q_t"], mfused_t, mp_t)
 
-            if do_viz:
+            mfused_t = bev_t
+            if do_viz and debugger is not None:
                 bank_state = self.bank.get_debug_state()
                 bank_maps  = self.bank.get_debug_maps(batch_idx=0)
                 mem_kinds  = dbg_t["mem_kinds"]
-
-                # Extract GT boxes — only present on the keyframe (t == T-1)
                 gt_boxes_np = TemporalDebugger.extract_gt_boxes(bd, batch_idx=0)
-
                 debugger.log_timestep(
                     t, bev_t, mfused_t, mp_t,
                     bank_state, bank_maps, mem_kinds,
                     q_t=dbg_t["q_t"],
                     st_keys=self.bank._st_keys,
                     batch_idx=0,
-                    gt_boxes=gt_boxes_np,       # None for sweep frames, [N,8] for keyframe
+                    gt_boxes=gt_boxes_np,
                     pc_range=self.pc_range,
                 )
             
-            # Explicitly free early frame BEV — no longer needed
             if t < T - 1:
                 del bev_t
                 del mfused_t
-                frames_list[t] = None   # free the batch dict too
+                frames_list[t] = None
             else:
                 mfused_last = mfused_t
                 dbg_last = dbg_t
                 mp_last = mp_t
 
-        
-        if do_viz and debugger is not None:
-            debugger.finish_sequence()
-        self.vis_counter += 1
-
         # ------------------------------------------------------------------
-        # Step 4: Detection head on keyframe only.
-        # Replace keyframe's raw BEV features with temporally-fused mfused_last.
-        # frames_list[-1] has gt_boxes → dense_head.forward stores targets internally
-        # for loss computation in get_training_loss().
+        # Step 4: Detection head on keyframe only
         # ------------------------------------------------------------------
         frames_list[-1]["spatial_features_2d"] = mfused_last
         frames_list[-1] = self.dense_head(frames_list[-1])
 
+        # After Step 4, before finish_sequence
+        if do_viz and debugger is not None:
+            final_boxes = frames_list[-1].get("final_box_dicts", None)
+            pred_boxes_np = None
+            if final_boxes is not None:
+                pb = final_boxes[0].get('pred_boxes', None)
+                if pb is not None:
+                    pred_boxes_np = pb.detach().cpu().numpy()
+
+            debugger.log_timestep(
+                T,                          # t=T to distinguish from the in-loop t=T-1 log
+                mfused_last, mfused_last, mp_last,
+                self.bank.get_debug_state(), {}, [],
+                batch_idx=0,
+                gt_boxes=TemporalDebugger.extract_gt_boxes(frames_list[-1], batch_idx=0),
+                pred_boxes=pred_boxes_np,
+                pc_range=self.pc_range,
+            )
+            debugger.finish_sequence()
+
+        self.vis_counter += 1
+
         # After Step 4
-        print("ahoj")
+        
         final_box = frames_list[-1].get("final_box_dicts", None)
-        if final_box:
-            scores = final_box[0]['pred_scores']
-            print(f"n_dets={len(scores)}, max_score={scores.max():.3f}, min_score={scores.min():.3f}")
 
         # ------------------------------------------------------------------
         # Step 5: Loss or prediction output.

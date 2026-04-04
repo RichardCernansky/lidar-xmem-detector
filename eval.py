@@ -160,24 +160,11 @@ def main():
                 compute_det_loss=False,
             )
 
-            if sample_idx < 3:
-                n_dets    = len(pred_dicts[0]["pred_scores"]) if pred_dicts else 0
-                max_score = float(pred_dicts[0]["pred_scores"].max()) if n_dets > 0 else 0.0
-                logger.info(
-                    f"[DBG] seq {sample_idx}: n_dets={n_dets}, "
-                    f"max_score={max_score:.3f}, "
-                    f"seq_token={seq.get('sample_token', 'N/A')}"
-                )
+       
 
             base_item      = test_set.base.__getitem__(sample_idx)
             base_batch_cpu = test_set.base.collate_batch([base_item])
 
-            base_token = base_item.get('metadata', {}).get('token', 
-            base_item.get('sample_token', 'MISSING'))
-            seq_token  = seq.get('sample_token', 'MISSING')
-            if sample_idx < 5:
-                match = "✓ MATCH" if base_token == seq_token else "✗ MISMATCH ←←← BUG"
-                print(f"[{sample_idx}] seq_token={seq_token}  base_token={base_token}  {match}")
 
             annos = test_set.base.generate_prediction_dicts(
                 batch_dict=base_batch_cpu,
@@ -185,6 +172,24 @@ def main():
                 class_names=cfg.CLASS_NAMES,
                 output_path=None,
             )
+        
+
+            # In eval.py, after generating annos, add:
+            if sample_idx == 0:
+                import json
+                a = annos[0]
+                print("ANNO KEYS:", list(a.keys()))
+                print("sample_token:", a.get('metadata', {}).get('token', 'MISSING'))
+                print("n_boxes:", len(a.get('boxes_lidar', [])))
+                print("first 3 boxes_lidar:\n", a.get('boxes_lidar', [])[:3])
+                print("first 3 names:", a.get('name', [])[:3])
+                print("first 3 scores:", a.get('score', [])[:3])
+                # Save to json for comparison
+                with open("anno_sample0.json", "w") as f:
+                    json.dump({k: v.tolist() if hasattr(v, 'tolist') else v 
+                            for k, v in a.items()}, f, indent=2)
+
+
             det_annos[sample_idx] = annos[0]
 
             if (sample_idx + 1) % int(args.log_interval) == 0:
