@@ -12,15 +12,12 @@ from xmem_det.temporal_pp import TemporalPointPillar
 from xmem_det.optimizer import (
     build_optimizer_with_prefix_multipliers,
     build_warmup_cosine_factor_scheduler,
-    linear_ramp,
-    _prob_sched_epoch
 )
 from my_logging import TrainStats, log_train_step, log_train_epoch_summary, _extract_losses
 
 from pcdet.config import cfg, cfg_from_yaml_file
 from pcdet.utils import common_utils
 
-from xmem_det.util import load_xmem_train_cfg
 from config_utils import (
     MissingConfigError,
     cfg_req_bool,
@@ -30,31 +27,14 @@ from config_utils import (
     cfg_req_nn,
     cfg_req_str,
     cfg_req_key,
-    _require_pos_int,
-    _require_prob_01
 )
 
-
-#return probability flag for stochastic decisions
-def sample_flag(p: float) -> bool:
-    p = _require_prob_01("p", float(p))
-    if p <= 0.0:
-        return False
-    if p >= 1.0:
-        return True
-    return bool(torch.rand((), device="cpu").item() < p)
 
 # set trainable parameters based on prefixes
 def set_trainable_prefixes(model, prefixes: List[str]) -> None:
     prefixes_t = tuple(prefixes)
     for n, p in model.named_parameters():
         p.requires_grad = n.startswith(prefixes_t)
-
-# get relative transform between current and previous frame
-def rel_T_curr_prev(T_world_lidar: np.ndarray, t: int) -> np.ndarray:
-    T_prev = T_world_lidar[t - 1]
-    T_curr = T_world_lidar[t]
-    return (np.linalg.inv(T_curr) @ T_prev).astype(np.float32)
 
 # convert frame dict to torch batch dict
 def to_torch_batch_dict(frame_dict: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
@@ -139,10 +119,8 @@ def train_one_epoch(
     total_epochs: int,
     logger,
     device: torch.device,
-    alpha_temporal: float,
     loop_cfg: Any,
     run_cfg: Any,
-    probs: Dict[str, float],
     phase_id: str,       #saving stuff
     extra_tag: str,       
     ckpt_name_tpl: str,     
@@ -157,7 +135,6 @@ def train_one_epoch(
 
     stats = TrainStats(w=int(stats_window))
 
-    det_mask_prev = None
     for seq_idx, seq in enumerate(train_loader):
         # Mid-epoch checkpoint every N sequences
         if save_every_seqs > 0 and (seq_idx + 1) % save_every_seqs == 0:
@@ -217,28 +194,17 @@ def train_one_epoch(
 
         
         # === FORWARD PASS ALL FRAMES AT ONCE ===
-        use_det_t0 = not sample_flag(probs.get("p_teacher"))
-        # print("use_det_t0:", use_det_t0)
-        ret_dict, tb_dict, disp_dict, det_masks = model(
+        ret_dict, tb_dict, disp_dict = model(
             frames_list=frames_list,
-            # alpha_temporal=float(alpha_temporal),
             compute_det_loss=True,
-            # compute_aux_loss=False,
-            # use_det_t0=use_det_t0,
         )
 
-
         loss = ret_dict["loss"]
-        
+
         # Backprop
         optimizer.zero_grad()
         torch.autograd.set_detect_anomaly(True)
         loss.backward()
-
-        # DEBUG VALS
-        # head_grad = model.dense_head.heads_list[0].hm[-1].weight.grad.abs().mean()
-        # print("head", head_grad)
-        # print("bank", model.bank.query_enc.weight.grad.abs().mean())
 
         clip_grad_norm_(model.parameters(), float(max_grad_norm))
         optimizer.step()
@@ -346,38 +312,18 @@ def train_phase(
         optimizer.load_state_dict(opt_state)
         scheduler.load_state_dict(sch_state)
 
-    alpha_start = cfg_req_float(phase_cfg, "ALPHA_START")
-    alpha_end = cfg_req_float(phase_cfg, "ALPHA_END")
-    alpha_ramp_epochs = cfg_req_int(phase_cfg, "ALPHA_RAMP_EPOCHS")
-
     ckpt_dir = cfg_req_str(run_cfg, "CKPT_DIR")
     ckpt_name_tpl = cfg_req_str(phase_cfg, "CKPT_NAME_TEMPLATE")
     os.makedirs(str(ckpt_dir), exist_ok=True)
 
     logger.info(
         f"Phase {phase_id} start: start_epoch={start_epoch}, end_epoch={end_epoch}, steps_per_epoch={len(train_loader)}, "
-        f"lr_start={float(lr_start):.3e}, lr_max={float(lr_max):.3e}, lr_end={float(lr_end):.3e}, warmup_epochs={int(warmup_epochs)}, "
-        f"alpha_start={float(alpha_start):.3f}, alpha_end={float(alpha_end):.3f}, alpha_ramp_epochs={int(alpha_ramp_epochs)}"
+        f"lr_start={float(lr_start):.3e}, lr_max={float(lr_max):.3e}, lr_end={float(lr_end):.3e}, warmup_epochs={int(warmup_epochs)}"
     )
 
     for epoch in range(int(start_epoch), int(end_epoch)):
-        alpha = linear_ramp(
-            epoch_idx=epoch,
-            start_epoch=int(start_epoch),
-            start=float(alpha_start),
-            end=float(alpha_end),
-            ramp_epochs=int(alpha_ramp_epochs),
-        )
-
-        probs = _prob_sched_epoch(phase_cfg=phase_cfg, epoch=epoch, start_epoch=int(start_epoch))
-
         lr = optimizer.param_groups[0]["lr"]
-        logger.info(
-            f"Epoch {epoch + 1}/{end_epoch} "
-            f"alpha={alpha:.3f} lr={lr:.3e} "
-            f"pT={probs['p_teacher']:.3f} "
-            # f"pT_last={probs['p_teacher_last']:.3f} pC_last={probs['p_corrupt_last']:.3f}"
-        )
+        logger.info(f"Epoch {epoch + 1}/{end_epoch} lr={lr:.3e}")
 
         train_one_epoch(
             model=model,
@@ -388,15 +334,13 @@ def train_phase(
             total_epochs=int(end_epoch),
             logger=logger,
             device=device,
-            alpha_temporal=float(alpha),
             loop_cfg=loop_cfg,
             run_cfg=run_cfg,
-            probs=probs,
             phase_id=phase_id,
             extra_tag=extra_tag,
             ckpt_name_tpl=ckpt_name_tpl,
             ckpt_dir=str(ckpt_dir),
-            save_every_seqs=2000, 
+            save_every_seqs=2000,
         )
 
         ckpt_path = os.path.join(
@@ -421,13 +365,11 @@ def train_phase(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cfg_file", type=str, required=True)
-    parser.add_argument("--xmem_cfg", type=str, required=True)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--extra_tag", type=str, default="default")
     args = parser.parse_args()
 
     cfg_from_yaml_file(args.cfg_file, cfg)
-    xmem_train_cfg = load_xmem_train_cfg(args.xmem_cfg)
 
     run_cfg = cfg_req_nn(cfg, "ADDONS.RUN")
     loop_cfg = cfg_req_nn(cfg, "ADDONS.TRAIN_LOOP")
@@ -466,14 +408,9 @@ def main():
         model_cfg=cfg.MODEL,
         num_class=num_class,
         dataset=train_set.base,
-        # xmem_train_cfg=xmem_train_cfg,
         pc_range=pc_range,
     )
     model.to(device)
-
-    names = [n for n, _ in model.named_parameters()]
-    tops = sorted({n.split(".")[0] for n in names})
-    print(tops)
 
     resume_ckpt = cfg_req_key(run_cfg, "RESUME_CKPT")
     pretrained_pp_ckpt = cfg_req_key(run_cfg, "PRETRAINED_PP_CKPT")
@@ -491,20 +428,6 @@ def main():
         state = ckpt["model_state"] if "model_state" in ckpt else ckpt
         model.load_state_dict(state, strict=False)
         logger.info(f"Loaded pretrained PP from {pretrained_pp_ckpt}")
-    
-        # LOAD HEAD FROM SCRATCH
-        # ckpt = torch.load(str(pretrained_pp_ckpt), map_location="cpu")
-        # state = ckpt["model_state"] if "model_state" in ckpt else ckpt
-        
-        # # Filter out dense_head
-        # backbone_state = {k: v for k, v in state.items() if not k.startswith('dense_head.')}
-        # skipped = len(state) - len(backbone_state)
-        
-        # missing, unexpected = model.load_state_dict(backbone_state, strict=False)
-        # logger.info(f"✅ Loaded backbone only from {pretrained_pp_ckpt}")
-        # logger.info(f"⏭️  Skipped {skipped} dense_head parameters (will be random)")
-        # logger.info(f"🎲 Missing (random): {len(missing)} parameters")
-
 
     # check required config keys
     cfg_req_int(phase_cfg, "START_EPOCH")
@@ -513,22 +436,12 @@ def main():
     cfg_req_float(phase_cfg, "LR_MAX")
     cfg_req_float(phase_cfg, "LR_END")
     cfg_req_int(phase_cfg, "WARMUP_EPOCHS")
-    cfg_req_float(phase_cfg, "ALPHA_START")
-    cfg_req_float(phase_cfg, "ALPHA_END")
-    cfg_req_int(phase_cfg, "ALPHA_RAMP_EPOCHS")
     cfg_req_str(phase_cfg, "CKPT_NAME_TEMPLATE")
-    cfg_req_nn(phase_cfg, "PROB_SCHEDULE")
     cfg_req_nn(phase_cfg, "OPT_GROUP_SPECS")
 
     cfg_req_int(loop_cfg, "STATS_WINDOW")
     cfg_req_int(loop_cfg, "LOG_EVERY")
     cfg_req_float(loop_cfg, "MAX_GRAD_NORM")
-    cfg_req_bool(loop_cfg, "FORCE_TEACHER_ON_T0")
-    cfg_req_bool(loop_cfg, "BURN_IN_TEACHER_FORCE")
-    cfg_req_bool(loop_cfg, "BURN_IN_OCC_CORRUPT")
-    cfg_req_float(loop_cfg, "OCC_DROP_RATE")
-    cfg_req_int(loop_cfg, "OCC_BLOCK")
-    cfg_req_float(loop_cfg, "XMEM_PREV_THR")
 
     cfg_req_str(run_cfg, "VIS_DIR")
     cfg_req_int(run_cfg, "VIS_EVERY_SEQS")
@@ -538,7 +451,7 @@ def main():
     cfg_req_bool(run_cfg, "USE_CKPT_EPOCH")
     cfg_req_bool(run_cfg, "RESUME_OPTIM_SCHED")
 
-    logger.info("Start training temporal PointPillar with config-driven linear schedules")
+    logger.info("Start training temporal PointPillar")
 
     train_phase(
         phase_id=str(phase_id),

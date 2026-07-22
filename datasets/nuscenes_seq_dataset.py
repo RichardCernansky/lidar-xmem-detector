@@ -16,8 +16,15 @@ class NuScenesSeqDataset(Dataset):
     Layout of one item (oldest → newest):
         [sweep_{-N}, sweep_{-N+2}, ..., sweep_{-2}, sweep_{-1}, KEYFRAME]
 
-    - Sweep frames: each in their OWN ego coordinate frame (no transform).
-      This gives the bank genuine temporal diversity across timesteps.
+    - Sweep frames: each aligned into the KEYFRAME's LIDAR frame via the
+      sweep's precomputed ego-motion transform_matrix (same alignment
+      OpenPCDet's baseline get_sweep() applies). This keeps BEV grid cell
+      (i, j) at the same physical location across every frame in the
+      sequence, which the ConvGRU (local 3x3 convs) and the bank's
+      key/value memory both assume holds between timesteps. Moving
+      objects, occlusion and sparsity still differ frame to frame, so
+      this does not make the BEVs identical -- it only removes the ego's
+      own motion, which was never itself useful signal.
     - Keyframe    : backbone + detection head + loss (has gt_boxes).
     - Bank resets at the start of every forward() call.
     """
@@ -57,11 +64,12 @@ class NuScenesSeqDataset(Dataset):
 
     def _load_sweep_points(self, sweep_info: dict) -> np.ndarray:
         """
-        Load sweep points in their OWN ego frame.
-        Intentionally does NOT apply transform_matrix — each sweep stays in
-        its own coordinate system so the bank sees genuine temporal diversity.
-        The baseline get_sweep() applies transform_matrix which pre-aligns
-        all sweeps to the keyframe frame, making every BEV identical.
+        Load sweep points and align them into the keyframe's LIDAR frame,
+        same as OpenPCDet's baseline get_sweep(). transform_matrix is a
+        precomputed 4x4 homogeneous transform (sweep sensor -> sweep ego ->
+        global -> keyframe ego -> keyframe sensor) already stored per sweep
+        in the dataset's info pkl; the first sweep in a scene has no `prev`
+        and stores transform_matrix=None (left unwarped, matching upstream).
         """
         def remove_ego_points(points, center_radius=1.0):
             mask = ~((np.abs(points[:, 0]) < center_radius) &
@@ -71,7 +79,14 @@ class NuScenesSeqDataset(Dataset):
         lidar_path = self.base.root_path / sweep_info['lidar_path']
         points = np.fromfile(str(lidar_path), dtype=np.float32, count=-1)
         points = points.reshape([-1, 5])[:, :4]        # x,y,z,intensity
-        points = remove_ego_points(points)              # no transform_matrix
+        points = remove_ego_points(points)
+
+        tm = sweep_info.get('transform_matrix', None)
+        if tm is not None:
+            xyz1 = np.concatenate(
+                [points[:, :3], np.ones((points.shape[0], 1), dtype=np.float32)], axis=1
+            )
+            points[:, :3] = (tm.astype(np.float32) @ xyz1.T).T[:, :3]
 
         times = sweep_info['time_lag'] * np.ones(
             (points.shape[0], 1), dtype=np.float32

@@ -42,35 +42,17 @@ ADDONS:
     LOG_EVERY: 50
     MAX_GRAD_NORM: 10.0
 
-    FORCE_TEACHER_ON_T0: true
-    BURN_IN_TEACHER_FORCE: false
-    BURN_IN_OCC_CORRUPT: false
-
-    OCC_DROP_RATE: 0.5
-    OCC_BLOCK: 8
-    XMEM_PREV_THR: 0.5
-
   PHASES:
     "0":
       PREFIXES: ["bank", "dense_head"]
 
-      START_EPOCH: 0 
+      START_EPOCH: 0
       END_EPOCH: 1
 
       LR_START: 3e-5
       LR_MAX: 3e-5
       LR_END: 3e-8
       WARMUP_EPOCHS: 0
-
-      ALPHA_START: 1.0  
-      ALPHA_END: 1.0
-      ALPHA_RAMP_EPOCHS: 5
-
-      PROB_SCHEDULE:
-        TEACHER:
-          START: 1.0
-          END: 1.0
-          RAMP_EPOCHS: 1
 
       OPT_GROUP_SPECS:
         - PREFIXES: ["dense_head"]
@@ -92,16 +74,6 @@ ADDONS:
       LR_END: 3e-7
       WARMUP_EPOCHS: 0
 
-      ALPHA_START: 1.0  
-      ALPHA_END: 1.0
-      ALPHA_RAMP_EPOCHS: 5
-
-      PROB_SCHEDULE:
-        TEACHER:
-          START: 1.0
-          END: 1.0
-          RAMP_EPOCHS: 1
-      
       OPT_GROUP_SPECS:
         - PREFIXES: ['bank.']
           LR_MULT: 1.0
@@ -109,72 +81,6 @@ ADDONS:
           LR_MULT: 0.5  # Let head adapt
         - PREFIXES: ['backbone_2d.']
           LR_MULT: 0.1
-
-      CKPT_NAME_TEMPLATE: "phase{phase}_{tag}_epoch_{epoch}.pth"
-
-    "2":
-      PREFIXES: ['bev_adapter', 'dense_head', 'readout_to_bev',  'xmem']
-
-      START_EPOCH: 13
-      END_EPOCH: 18
-
-      LR_START: 5e-6
-      LR_MAX: 2e-4
-      LR_END: 2e-6
-      WARMUP_EPOCHS: 1
-
-      ALPHA_START: 0.2
-      ALPHA_END: 0.7
-      ALPHA_RAMP_EPOCHS: 5
-
-      PROB_SCHEDULE:
-        TEACHER:
-          START: 1.0
-          END: 1.0
-          RAMP_EPOCHS: 1
-
-      OPT_GROUP_SPECS:
-        - PREFIXES: ["xmem"]
-          LR_MULT: 0.6
-        - PREFIXES: ["hidden_to_bev"]
-          LR_MULT: 1.0
-        - PREFIXES: ["dense_head"]
-          LR_MULT: 1.0
-        - PREFIXES: ["backbone_2d"]
-          LR_MULT: 0.0
-
-      CKPT_NAME_TEMPLATE: "phase{phase}_{tag}_epoch_{epoch}.pth"
-
-    "3":
-      PREFIXES: ['bev_adapter', 'dense_head', 'readout_to_bev',  'xmem']
-
-      START_EPOCH: 18
-      END_EPOCH: 20
-
-      LR_START: 2e-6
-      LR_MAX: 5e-5
-      LR_END: 1e-6
-      WARMUP_EPOCHS: 0
-
-      ALPHA_START: 0.6
-      ALPHA_END: 0.6
-      ALPHA_RAMP_EPOCHS: 1
-
-      PROB_SCHEDULE:
-        TEACHER:
-          START: 1.0
-          END: 1.0
-          RAMP_EPOCHS: 1
-
-      OPT_GROUP_SPECS:
-        - PREFIXES: ["xmem"]
-          LR_MULT: 0.6
-        - PREFIXES: ["hidden_to_bev"]
-          LR_MULT: 1.0
-        - PREFIXES: ["dense_head"]
-          LR_MULT: 1.0
-        - PREFIXES: ["backbone_2d"]
-          LR_MULT: 0.0
 
       CKPT_NAME_TEMPLATE: "phase{phase}_{tag}_epoch_{epoch}.pth"
 

@@ -1,20 +1,13 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
 
 from pcdet.models.detectors.pointpillar import PointPillar
-from xmem_det.util import boxes_to_bev_masks
 from xmem_det.visualizer import TemporalDebugger
 from xmem_det.memory_fuser import ReasonNetTemporalBank
-
-import os
-import matplotlib.pyplot as plt
 
 
 class TemporalPointPillar(PointPillar):
 
-    def __init__(self, model_cfg, num_class, dataset, pc_range, key_dim: int = 64, max_bank_frames: int = 8):
+    def __init__(self, model_cfg, num_class, dataset, pc_range, key_dim: int = 64):
         super().__init__(model_cfg=model_cfg, num_class=num_class, dataset=dataset)
         if pc_range is None:
             raise ValueError("pc_range must be provided")
@@ -23,9 +16,7 @@ class TemporalPointPillar(PointPillar):
         # c_bev: number of BEV feature channels output by backbone_2d (e.g. 384 for BaseBEVBackbone)
         self.c_bev = int(self.backbone_2d.num_bev_features)
         self.bank = ReasonNetTemporalBank(c_bev=self.c_bev, key_dim=int(key_dim))
-        
 
-        self.debug_last = {}
         self.vis_counter = 0
         self.eval_vis_dir: str = None   # set to a path to enable vis during eval
 
@@ -105,110 +96,6 @@ class TemporalPointPillar(PointPillar):
         self.dense_head.train(was_training)  # restore training mode
         return mp_combined
 
-    # not needed now
-    def _create_mp_from_gt(self, batch_dict: dict) -> torch.Tensor:
-        """
-        Alternative Mp_t from GT boxes via CenterPoint's target assignment.
-        Only valid for the keyframe (sweep frames have no gt_boxes).
-
-        Uses assign_targets which is parameter-free — pure geometric computation.
-        This avoids any dependency on the head's learned weights and gives a
-        perfect, noise-free Mp_t for the keyframe during training.
-
-        Currently not used (we rely on pretrained head predictions for consistency
-        between training and inference), but kept for ablation experiments.
-        """
-        spatial_features = batch_dict['spatial_features_2d']
-        B, C, H, W = spatial_features.shape
-        device = spatial_features.device
-        dtype = spatial_features.dtype
-
-        with torch.no_grad():
-            target_dict = self.dense_head.assign_targets(
-                gt_boxes=batch_dict['gt_boxes'],
-                feature_map_size=(H, W),
-                feature_map_stride=batch_dict.get('spatial_features_2d_strides', None)
-            )
-
-        mp_t = self._convert_target_dict_to_mp(target_dict, B, H, W, device, dtype)
-        return mp_t
-    def _convert_target_dict_to_mp(
-        self,
-        target_dict: dict,
-        B: int, H: int, W: int,
-        device: torch.device,
-        dtype: torch.dtype
-    ) -> torch.Tensor:
-        """
-        Convert CenterPoint's sparse target_dict to dense [B, 7, H, W] Mp_t.
-
-        target_dict layout (per head):
-          'heatmaps'    : [B, num_cls, H, W]   Gaussian heatmap at object centers
-          'target_boxes': [B, num_max_objs, K]  box params at each object (sparse)
-          'inds'        : [B, num_max_objs]     linear index (y*W + x) into H×W grid
-          'masks'       : [B, num_max_objs]     1 = valid object, 0 = padding
-
-        target_boxes column layout (K dims):
-          [0,1]: center xy offset within voxel
-          [2]  : z
-          [3,4,5]: log(w), log(l), log(h)
-          [6,7]: cos(heading), sin(heading)
-          [8,9]: vx, vy  (if velocity head present)
-
-        We scatter the sparse object params to their spatial locations using 'inds'.
-        Uses vectorised scatter_ instead of Python loops for speed.
-        """
-        mp_t = torch.zeros(B, 7, H, W, device=device, dtype=dtype)
-
-        for head_idx in range(len(target_dict['heatmaps'])):
-            heatmap     = target_dict['heatmaps'][head_idx]      # [B, num_cls, H, W]
-            target_boxes = target_dict['target_boxes'][head_idx]  # [B, num_max_objs, K]
-            inds        = target_dict['inds'][head_idx]           # [B, num_max_objs]
-            masks       = target_dict['masks'][head_idx]          # [B, num_max_objs] bool/int
-
-            # Channel 0: existence — max Gaussian value over all classes
-            heatmap_max = heatmap.max(dim=1, keepdim=True)[0]    # [B, 1, H, W]
-            mp_t[:, 0:1] = torch.max(mp_t[:, 0:1], heatmap_max)
-
-            # Build the 6 geometry channels to scatter: [B, num_max_objs, 6]
-            K = target_boxes.shape[2]
-            box_feats = torch.zeros(B, inds.shape[1], 6, device=device, dtype=dtype)
-
-            box_feats[:, :, 0] = target_boxes[:, :, 0]           # x offset
-            box_feats[:, :, 1] = target_boxes[:, :, 1]           # y offset
-            if K > 4:
-                box_feats[:, :, 2] = target_boxes[:, :, 4].exp() # width  = exp(log_w)
-                box_feats[:, :, 3] = target_boxes[:, :, 3].exp() # length = exp(log_l)
-            if K > 7:
-                cos_h = target_boxes[:, :, 6]
-                sin_h = target_boxes[:, :, 7]
-                box_feats[:, :, 4] = torch.atan2(sin_h, cos_h)   # heading angle
-            if K > 9:
-                vx = target_boxes[:, :, 8]
-                vy = target_boxes[:, :, 9]
-                box_feats[:, :, 5] = torch.sqrt(vx ** 2 + vy ** 2 + 1e-8)  # speed
-
-            # Zero out padding objects using mask
-            valid_mask = masks.bool().unsqueeze(-1)               # [B, num_max_objs, 1]
-            box_feats = box_feats * valid_mask
-
-            # Vectorised scatter: for each valid object, write its 6 geometry values
-            # to the spatial location given by its linear index.
-            # inds: [B, num_max_objs] — each entry is y*W + x
-            inds_long = inds.long().clamp(0, H * W - 1)           # [B, num_max_objs]
-
-            for c_offset, mp_ch in enumerate(range(1, 7)):
-                # src: [B, num_max_objs] — the c_offset-th geometry value per object
-                src = box_feats[:, :, c_offset]                    # [B, num_max_objs]
-                # target: [B, H*W] flat spatial grid
-                flat = mp_t[:, mp_ch].reshape(B, H * W)
-                # scatter_: for each obj, write src value at its linear index
-                # 'reduce=max' would be ideal but not available everywhere; default overwrites
-                flat.scatter_(1, inds_long, src)
-                mp_t[:, mp_ch] = flat.reshape(B, H, W)
-
-        return mp_t
-
     # ------------------------------------------------------------------
     # Main forward
     # ------------------------------------------------------------------
@@ -229,28 +116,6 @@ class TemporalPointPillar(PointPillar):
         if T <= 0:
             raise ValueError("frames_list is empty")
 
-        # ------------------------------------------------------------------
-        # Step 1: Run backbone on ALL frames upfront (before temporal loop).
-        # We run all frames through VFE → MAP_TO_BEV → BACKBONE_2D but stop
-        # before the dense_head (temporal fusion happens between backbone and head).
-        # ------------------------------------------------------------------
-        # bev_list = []
-        # for t in range(T):
-        #     bd = frames_list[t]
-        #     for cur_module in self.module_list:
-        #         if cur_module is self.dense_head:
-        #             break                          # stop before detection head
-        #         bd = cur_module(bd)
-        #     frames_list[t] = bd
-        #     bev_list.append(bd["spatial_features_2d"])  # [B, C, H, W]
-
-        # ------------------------------------------------------------------
-        # Step 2: Reset bank for this new sequence.
-        # Done AFTER backbone pass so any exception in backbone doesn't leave
-        # the bank in a half-reset state for the temporal loop.
-        # ------------------------------------------------------------------
-        # self.bank.reset()
-
         mfused_last = None
         dbg_last    = None
         mp_last     = None
@@ -264,8 +129,8 @@ class TemporalPointPillar(PointPillar):
             debugger = TemporalDebugger(save_dir=save_dir, log_every=1, max_batches=1)
             debugger.start_sequence(seq_name=f"seq{self.vis_counter:03d}")
 
-# ------------------------------------------------------------------
-        # Step 3: Temporal reasoning loop
+        # ------------------------------------------------------------------
+        # Temporal reasoning loop
         # ------------------------------------------------------------------
         self.bank.reset()
 
@@ -283,7 +148,6 @@ class TemporalPointPillar(PointPillar):
             mp_t = self._get_mp_from_head_nograd(frames_list[t], mfused_t)
             self.bank.update_bank(dbg_t["q_t"], mfused_t, mp_t)
 
-            mfused_t = bev_t
             if do_viz and debugger is not None:
                 bank_state = self.bank.get_debug_state()
                 bank_maps  = self.bank.get_debug_maps(batch_idx=0)
@@ -336,16 +200,12 @@ class TemporalPointPillar(PointPillar):
 
         self.vis_counter += 1
 
-        # After Step 4
-        
-        final_box = frames_list[-1].get("final_box_dicts", None)
-
         # ------------------------------------------------------------------
-        # Step 5: Loss or prediction output.
+        # Loss or prediction output.
         # ------------------------------------------------------------------
         if self.training and compute_det_loss:
             # get_training_loss() reads from dense_head.forward_ret_dict which was
-            # populated in Step 4. It computes heatmap loss + box regression loss
+            # populated above. It computes heatmap loss + box regression loss
             # against the gt_boxes in frames_list[-1].
             loss_det, tb_dict, disp_dict = self.get_training_loss()
 
@@ -355,14 +215,7 @@ class TemporalPointPillar(PointPillar):
             tb_dict["loss_total"] = loss_total.detach()
             tb_dict["loss_det"]   = loss_det.detach() if loss_det is not None else torch.zeros((), device=dev)
 
-            # Store debug tensors (detached — no graph retention after backward)
-            self.debug_last = {
-                k: (v.detach() if isinstance(v, torch.Tensor) else v)
-                for k, v in dbg_last.items()
-            }
-            self.debug_last["mp_last"] = mp_last.detach()
-
-            return {"loss": loss_total}, tb_dict, disp_dict, None
+            return {"loss": loss_total}, tb_dict, disp_dict
 
         # Inference path: dense_head populates final_box_dicts via post-processing
         final_box = frames_list[-1].get("final_box_dicts", None)

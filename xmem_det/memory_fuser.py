@@ -115,12 +115,15 @@ class ReasonNetValueEnc(nn.Module):
 
 class ReasonNetTemporalBank(nn.Module):
     """
-
     Two sources of temporal context per frame:
-      1. _gru_h: ConvGRU hidden state that carries compressed history forward
-                 across real timesteps via truncated BPTT (detached between steps)
+      1. ConvGRU: aggregates this step's memory readouts (oldest -> newest)
+                 with the current bev_t into a single fused feature map.
+                 Starts from zero every call -- it does not carry hidden
+                 state across real timesteps, only across the memory frames
+                 read within a single compute_mfused() call.
       2. Memory bank: explicit key/value store read via L2 attention,
-                 gives direct access to specific past feature maps
+                 gives direct access to specific past feature maps. This is
+                 what actually carries information across real timesteps.
 
     Memory layout:
       Short-term buffer (_st_*): last `ts` stored frames, full spatial resolution.
@@ -156,7 +159,6 @@ class ReasonNetTemporalBank(nn.Module):
         self.max_from_discard  = int(max_from_discard)
         self.q_chunk           = int(q_chunk)
 
-        self.gru_scale = nn.Parameter(torch.zeros(1))       
         # Query encoder: projects BEV features to a lower-dim key space.
         # Keys are in R^key_dim, values stay in R^c_bev.
         # Smaller key_dim reduces attention computation cost.
@@ -193,8 +195,6 @@ class ReasonNetTemporalBank(nn.Module):
         self._lt_vals: List[torch.Tensor] = []
         self._lt_fill: List[int]          = []   # how many tokens in each LT frame
 
-        # GRU hidden state — persists across real timesteps, reset between sequences
-        self._gru_h: Optional[torch.Tensor] = None   # [B, c_bev, H, W]
         self._hw:    Optional[Tuple[int, int]] = None
         self._step:  int = 0  # counts update_bank calls (for tau stride)
 
@@ -212,7 +212,6 @@ class ReasonNetTemporalBank(nn.Module):
         self._lt_keys  = []
         self._lt_vals  = []
         self._lt_fill  = []
-        self._gru_h    = None   # GRU hidden state reset — next frame starts from zeros
         self._hw       = None
         self._step     = 0
 
@@ -404,10 +403,8 @@ class ReasonNetTemporalBank(nn.Module):
  
         b, c, h, w = bev_t.shape
 
-        # Step 1: initialise GRU hidden state to zeros on first call
-        if self._gru_h is None:
-            self._gru_h = torch.zeros(b, self.c_bev, h, w,
-                                      device=bev_t.device, dtype=bev_t.dtype)
+        # Step 1: track spatial shape for the lifetime of this sequence
+        if self._hw is None:
             self._hw = (h, w)
         else:
             h0, w0 = self._hw
@@ -433,10 +430,9 @@ class ReasonNetTemporalBank(nn.Module):
                 self._st_usage[mi] = self._st_usage[mi] + usage.reshape(b, h, w)
 
 
-        # Step 4: ConvGRU sequential fusion
+        # Step 4: ConvGRU sequential fusion, starting from zero each call.
         # process history FIRST (oldest → newest), current frame LAST.
-        # h_t = self._gru_h  # start from persistent state (detached value from last step)
-        h_t = torch.zeros_like(self._gru_h)  # begin from zero - aggregator only
+        h_t = torch.zeros_like(bev_t)
 
         # History: memory readouts ordered oldest → newest (as returned by _collect_memory)
         for m_map in m_frames:
@@ -445,24 +441,10 @@ class ReasonNetTemporalBank(nn.Module):
         # Current frame last: h_t now represents "current BEV given all temporal context"
         h_t = self.gru(bev_t, h_t)
 
-        # DEBUG VALS
-        # with torch.no_grad():
-        #     xh = torch.cat([bev_t, h_t], dim=1)
-        #     rz = torch.sigmoid(self.gru.gates(xh))
-        #     _, z = rz.chunk(2, dim=1)
-        #     print(f"GRU z gate mean={z.mean():.3f} std={z.std():.3f}")
-
-        # _gru_h is used as the starting h in the NEXT call — it carries temporal
-        # information forward in time without carrying the computation graph.
-        # self._gru_h = h_t.detach()
-
-        # Step 6: normalise and return.
-        # mfused_t uses the ORIGINAL h_t (not detached) so gradients from loss
-        # flow back through this step's GRU calls into bev_t and GRU weights.
-
+        # Step 5: normalise and return. mfused_t uses the ORIGINAL h_t (not
+        # detached) so gradients from loss flow back through this step's GRU
+        # calls into bev_t and GRU weights.
         mfused_t = self.gru_output_norm(h_t)  # [B, c_bev, H, W]
-        # mfused_t = bev_t + self.gru_output_norm(h_t)  # [B, c_bev, H, W]
-        # mfused_t = bev_t + torch.sigmoid(self.gru_scale) * self.gru_output_norm(h_t)
 
         dbg = {
             "q_t":       q_t,
