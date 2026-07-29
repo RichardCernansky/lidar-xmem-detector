@@ -23,13 +23,11 @@ ADDONS:
     CKPT_DIR: "log/ckpt"
 
     # either one of RESUME_CKPT and PRETRAINED_PP_CKPT can be set to non-null
-    # RESUME_CKPT: "log/ckpt/phase0_10hz_epoch_4.pth"
-    RESUME_CKPT: null
-    # PRETRAINED_PP_CKPT: null
-    PRETRAINED_PP_CKPT: "/home/cernanskyr/OpenPCDet/output/cfgs/nuscenes_models/cbgs_dyn_pp_centerpoint/dynpp_centerpoint_pretrain/ckpt/checkpoint_epoch_20.pth"
+    RESUME_CKPT: "log/ckpt/phase0_full_v6_epoch_1.pth"
+    PRETRAINED_PP_CKPT: null
 
     USE_CKPT_EPOCH: true
-    RESUME_OPTIM_SCHED: false 
+    RESUME_OPTIM_SCHED: true
 
   DATALOADER:
     BATCH_SIZE: 1
@@ -42,45 +40,44 @@ ADDONS:
     LOG_EVERY: 50
     MAX_GRAD_NORM: 10.0
 
+  # PHASES target xmem_det.temporal_pp_GRU.TemporalPointPillar's module names
+  # (conv_gru/gru_proj/dense_head/backbone_2d/vfe), not the bank model's.
+  #
+  # TimePillars-style transfer learning, ONE phase (their section 4.2):
+  # stage 1 (single-frame pretraining) already happened externally --
+  # that's ADDONS.RUN.PRETRAINED_PP_CKPT. This phase is their stage 2:
+  # freeze the pillar encoder (vfe, never listed below) and the backbone's
+  # downsampling layers (backbone_2d.blocks.0/.1, also never listed), and
+  # train everything else -- the GRU, backbone_2d.blocks.2 + all of
+  # backbone_2d.deblocks (upsampling), and dense_head -- together, from
+  # the start. No separate "new components only" warm-up phase first.
   PHASES:
     "0":
-      PREFIXES: ["bank", "dense_head"]
-
+      PREFIXES: [
+        'conv_gru.', 'gru_proj.', 'dense_head.',
+        'backbone_2d.blocks.2.', 'backbone_2d.deblocks.',
+      ]
       START_EPOCH: 0
-      END_EPOCH: 1
+      END_EPOCH: 10
 
-      LR_START: 3e-5
-      LR_MAX: 3e-5
-      LR_END: 3e-8
-      WARMUP_EPOCHS: 0
+      # LR_MAX raised ~7x from 3e-5: conv_gru/gru_proj are randomly initialized
+      # and learning long-horizon memory retention/forgetting from scratch, not
+      # fine-tuning already-good weights -- 3e-5 is a fine-tuning LR, not a
+      # from-scratch one (compare: the single-sweep pretrain itself used LR=1e-3).
+      # dense_head/backbone LR_MULTs lowered so their effective LR rises less
+      # than the raw LR_MAX increase, since those parts are already calibrated.
+      LR_START: 0
+      LR_MAX: 2e-4
+      LR_END: 2e-7
+      WARMUP_EPOCHS: 1
 
       OPT_GROUP_SPECS:
-        - PREFIXES: ["dense_head"]
-          LR_MULT: 1.0
-        - PREFIXES: ["bank"]
-          LR_MULT: 1.0
-        - PREFIXES: ["backbone_2d"]
-          LR_MULT: 0.0
-
-      CKPT_NAME_TEMPLATE: "phase{phase}_{tag}_epoch_{epoch}.pth"
-
-    "1":
-      PREFIXES: ['bank.', 'dense_head.', 'backbone_2d.']
-      START_EPOCH: 0
-      END_EPOCH: 8
-
-      LR_START: 2e-5
-      LR_MAX: 2e-5
-      LR_END: 3e-7
-      WARMUP_EPOCHS: 0
-
-      OPT_GROUP_SPECS:
-        - PREFIXES: ['bank.']
+        - PREFIXES: ['conv_gru.', 'gru_proj.']
           LR_MULT: 1.0
         - PREFIXES: ['dense_head.']
-          LR_MULT: 0.5  # Let head adapt
-        - PREFIXES: ['backbone_2d.']
-          LR_MULT: 0.1
+          LR_MULT: 0.25  # Let head adapt
+        - PREFIXES: ['backbone_2d.blocks.2.', 'backbone_2d.deblocks.']
+          LR_MULT: 0.05
 
       CKPT_NAME_TEMPLATE: "phase{phase}_{tag}_epoch_{epoch}.pth"
 
@@ -92,6 +89,11 @@ DATA_CONFIG:
     _BASE_CONFIG_: xmem_det/configs/nuscenes_dataset.yaml
 
     POINT_CLOUD_RANGE: [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+    SWEEP_STRIDE: 2  # spacing between raw sweeps picked into each sample's history; independent of TRAIN.STRIDE
+    MAX_SWEEPS: 1    # keyframe loads only its own single raw sweep (self.base.__getitem__ ->
+                      # get_lidar_with_sweeps(max_sweeps=1), no aggregation), matching the
+                      # single_sweep pretrain and the paper's "every frame = one scan" design.
+                      # Was inherited as 10 from nuscenes_dataset.yaml before this override.
     DATA_PROCESSOR:
         -   NAME: mask_points_and_boxes_outside_range
             REMOVE_OUTSIDE_BOXES: True
@@ -103,7 +105,9 @@ DATA_CONFIG:
             }
 
         -   NAME: transform_points_to_voxels_placeholder
-            VOXEL_SIZE: [0.2, 0.2, 8.0]
+            VOXEL_SIZE: [0.32, 0.32, 8.0]  # must match the pretrain's voxel size (was 0.2, 0.2) --
+                                             # grid_size/voxel_size feed PointPillarScatter's BEV
+                                             # canvas dims and CenterHead's coord conversion directly
 
 MODEL:
     NAME: CenterPoint

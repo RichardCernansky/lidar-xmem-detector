@@ -1,5 +1,5 @@
 """
-Evaluation script for TemporalPointPillar with TemporalDebugger visualization.
+Evaluation script for TemporalPointPillar.
 """
 
 import argparse
@@ -15,7 +15,7 @@ from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_to_f
 from pcdet.utils import common_utils
 
 from datasets.nuscenes_seq_dataset import NuScenesSeqDataset, collate_seq
-from xmem_det.temporal_pp import TemporalPointPillar
+from xmem_det.temporal_pp_GRU import TemporalPointPillar
 
 
 def to_torch_batch_dict(frame_dict: dict, device: torch.device) -> dict:
@@ -44,10 +44,21 @@ def parse_args():
     p.add_argument("--extra_tag",    type=str, default="default")
     p.add_argument("--eval_tag",     type=str, default="sweep_eval")
     p.add_argument("--log_interval", type=int, default=50)
-    p.add_argument("--vis_dir",      type=str, default=None,
-                   help="Enable TemporalDebugger vis and save to this directory.")
+    p.add_argument("--random_window", action="store_true",
+                   help="Diagnostic: per-sample, replicate training's exact window-length "
+                        "sampling (num_warmup = randint(max(1, T-3), T), a uniformly random "
+                        "4-6 frame window for T=6) instead of always feeding the full window. "
+                        "Default: no truncation (full window, matching normal eval).")
+    p.add_argument("--window_len", type=int, default=None,
+                   help="Diagnostic: truncate every sequence to a fixed last N frames "
+                        "(keyframe + N-1 preceding sweeps), e.g. --window_len 3 to match "
+                        "the paper's Table 1 'Scans: 3' reporting convention. Mutually "
+                        "exclusive with --random_window.")
     p.add_argument("--set", dest="set_cfgs", default=None, nargs=argparse.REMAINDER)
     args = p.parse_args()
+
+    if args.window_len is not None and args.random_window:
+        p.error("--window_len and --random_window are mutually exclusive")
 
     cfg_from_yaml_file(args.cfg_file, cfg)
     if args.set_cfgs is not None:
@@ -75,10 +86,12 @@ def main():
     logger.info(f"cfg_file={args.cfg_file}")
     logger.info(f"ckpt={args.ckpt}")
     logger.info(f"split={cfg.DATA_CONFIG.DATA_SPLIT['test']}")
+    logger.info(f"random_window={args.random_window}")
+    logger.info(f"window_len={args.window_len if args.window_len is not None else 'full (no truncation)'}")
     log_config_to_file(cfg, logger=logger)
 
     # ------------------------------------------------------------------
-    # Dataset  (stride=1 is critical: sequence_indices[i] == i == kf_idx)
+    # Dataset  (keyframe_stride=1 is critical: sequence_indices[i] == i == kf_idx)
     # ------------------------------------------------------------------
     seq_len      = int(getattr(cfg.TRAIN, "SEQ_LEN", 4))
     sweep_stride = int(getattr(cfg.DATA_CONFIG, "SWEEP_STRIDE", 2))
@@ -89,7 +102,7 @@ def main():
         training=False,
         logger=logger,
         seq_len=seq_len,
-        stride=1,
+        keyframe_stride=1,
         nusc_version=cfg.DATA_CONFIG.VERSION,
         nusc_dataroot=cfg.DATA_CONFIG.DATA_PATH,
         root_path=None,
@@ -98,7 +111,7 @@ def main():
 
     assert len(test_set) == len(test_set.base), (
         f"Dataset length mismatch: seq={len(test_set)} base={len(test_set.base)}. "
-        f"stride must be 1 for eval."
+        f"keyframe_stride must be 1 for eval."
     )
     logger.info(f"Dataset: {len(test_set)} sequences, seq_len={seq_len}, sweep_stride={sweep_stride}")
 
@@ -133,11 +146,6 @@ def main():
 
     model.eval()
 
-    # Set eval_vis_dir to enable TemporalDebugger during inference
-    if args.vis_dir:
-        model.eval_vis_dir = args.vis_dir
-        logger.info(f"Visualization enabled → {args.vis_dir}")
-
     logger.info("Model loaded and set to eval mode.")
 
     # ------------------------------------------------------------------
@@ -154,6 +162,13 @@ def main():
 
             frames      = seq["frames"]
             frames_list = [to_torch_batch_dict(f, device) for f in frames]
+            if args.random_window:
+                T = len(frames_list)
+                if T > 1:
+                    num_warmup = int(np.random.randint(max(1, T - 3), T))
+                    frames_list = frames_list[-(num_warmup + 1):]
+            elif args.window_len is not None:
+                frames_list = frames_list[-int(args.window_len):]
 
             pred_dicts, recall_dicts, dbg = model(
                 frames_list=frames_list,

@@ -8,7 +8,7 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 
 from datasets.nuscenes_seq_dataset import NuScenesSeqDataset, collate_seq
-from xmem_det.temporal_pp import TemporalPointPillar
+from xmem_det.temporal_pp_GRU import TemporalPointPillar
 from xmem_det.optimizer import (
     build_optimizer_with_prefix_multipliers,
     build_warmup_cosine_factor_scheduler,
@@ -56,7 +56,7 @@ def to_torch_batch_dict(frame_dict: Dict[str, Any], device: torch.device) -> Dic
 # build sequence data loader
 def build_seq_loader(cfg_obj, logger, workers_arg: int):
     seq_len = cfg_req_int(cfg_obj, "TRAIN.SEQ_LEN")
-    stride = cfg_req_int(cfg_obj, "TRAIN.STRIDE")
+    keyframe_stride = cfg_req_int(cfg_obj, "TRAIN.STRIDE")
 
     dl_cfg = cfg_req_nn(cfg_obj, "ADDONS.DATALOADER")
     batch_size = cfg_req_int(dl_cfg, "BATCH_SIZE")
@@ -66,6 +66,7 @@ def build_seq_loader(cfg_obj, logger, workers_arg: int):
 
     dataset_cfg = cfg_obj.DATA_CONFIG
     class_names = cfg_obj.CLASS_NAMES
+    sweep_stride = int(getattr(dataset_cfg, "SWEEP_STRIDE", 2))
 
     train_set = NuScenesSeqDataset(
         dataset_cfg=dataset_cfg,
@@ -74,9 +75,10 @@ def build_seq_loader(cfg_obj, logger, workers_arg: int):
         root_path=None,
         logger=logger,
         seq_len=int(seq_len),
-        stride=int(stride),
+        keyframe_stride=int(keyframe_stride),
         nusc_version=dataset_cfg.VERSION,
         nusc_dataroot=dataset_cfg.DATA_PATH,
+        sweep_stride=sweep_stride,
     )
 
     num_workers_cap = cfg_req_int(cfg_obj, "OPTIMIZATION.NUM_WORKERS")
@@ -121,11 +123,6 @@ def train_one_epoch(
     device: torch.device,
     loop_cfg: Any,
     run_cfg: Any,
-    phase_id: str,       #saving stuff
-    extra_tag: str,       
-    ckpt_name_tpl: str,     
-    ckpt_dir: str,          
-    save_every_seqs = 2000,   
 ):
     model.train()
 
@@ -136,29 +133,6 @@ def train_one_epoch(
     stats = TrainStats(w=int(stats_window))
 
     for seq_idx, seq in enumerate(train_loader):
-        # Mid-epoch checkpoint every N sequences
-        if save_every_seqs > 0 and (seq_idx + 1) % save_every_seqs == 0:
-            ckpt_path = os.path.join(
-                ckpt_dir,
-                ckpt_name_tpl.format(
-                    phase=phase_id,
-                    tag=extra_tag,
-                    epoch=f"{epoch + 1}_seq{seq_idx + 1}"
-                ),
-            )
-            torch.save(
-                {
-                    "model_state": model.state_dict(),
-                    "epoch": epoch + 1,
-                    "seq_idx": seq_idx + 1,
-                    "optimizer_state": optimizer.state_dict(),
-                    "scheduler_state": scheduler.state_dict(),
-                    "phase": phase_id,
-                },
-                ckpt_path,
-            )
-            logger.info(f"Mid-epoch checkpoint saved to {ckpt_path}")
-
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats()
 
@@ -200,12 +174,11 @@ def train_one_epoch(
         )
 
         loss = ret_dict["loss"]
-
+        
         # Backprop
         optimizer.zero_grad()
         torch.autograd.set_detect_anomaly(True)
         loss.backward()
-
         clip_grad_norm_(model.parameters(), float(max_grad_norm))
         optimizer.step()
         if scheduler is not None:
@@ -293,10 +266,15 @@ def train_phase(
         group_specs=group_specs,
     )
 
+    # Scheduler's total span must stay anchored to the phase's configured
+    # START_EPOCH, not the (possibly resumed) start_epoch -- otherwise a
+    # resumed run rebuilds the lambda over a shorter "remaining epochs"
+    # span while restoring a step counter that was advanced against the
+    # original full-phase span, landing on the wrong point of the curve.
     scheduler = build_warmup_cosine_factor_scheduler(
         optimizer=optimizer,
         steps_per_epoch=len(train_loader),
-        epochs=(int(end_epoch) - int(start_epoch)),
+        epochs=(int(end_epoch) - int(start_epoch_cfg)),
         lr_start=float(lr_start),
         lr_max=float(lr_max),
         lr_end=float(lr_end),
@@ -336,11 +314,6 @@ def train_phase(
             device=device,
             loop_cfg=loop_cfg,
             run_cfg=run_cfg,
-            phase_id=phase_id,
-            extra_tag=extra_tag,
-            ckpt_name_tpl=ckpt_name_tpl,
-            ckpt_dir=str(ckpt_dir),
-            save_every_seqs=2000,
         )
 
         ckpt_path = os.path.join(
@@ -395,9 +368,10 @@ def main():
     logger = common_utils.create_logger(log_file)
 
     seq_len = cfg_req_int(cfg, "TRAIN.SEQ_LEN")
-    stride = cfg_req_int(cfg, "TRAIN.STRIDE")
+    keyframe_stride = cfg_req_int(cfg, "TRAIN.STRIDE")
+    sweep_stride = int(getattr(cfg.DATA_CONFIG, "SWEEP_STRIDE", 2))
     logger.info(str(cfg))
-    logger.info(f"seq_len={seq_len}, stride={stride}")
+    logger.info(f"seq_len={seq_len}, keyframe_stride={keyframe_stride}, sweep_stride={sweep_stride}")
 
     train_set, train_loader = build_seq_loader(cfg_obj=cfg, logger=logger, workers_arg=int(args.workers))
 
@@ -421,13 +395,17 @@ def main():
     resume_blob = None
     if resume_ckpt is not None:
         resume_blob = torch.load(str(resume_ckpt), map_location="cpu")
-        model.load_state_dict(resume_blob["model_state"], strict=False)
+        missing, unexpected = model.load_state_dict(resume_blob["model_state"], strict=False)
         logger.info(f"Resumed model from {resume_ckpt} at epoch {int(resume_blob.get('epoch', 0))}")
+        logger.info(f"  missing_keys={len(missing)}: {missing}")
+        logger.info(f"  unexpected_keys={len(unexpected)}: {unexpected}")
     elif pretrained_pp_ckpt is not None:
         ckpt = torch.load(str(pretrained_pp_ckpt), map_location="cpu")
         state = ckpt["model_state"] if "model_state" in ckpt else ckpt
-        model.load_state_dict(state, strict=False)
+        missing, unexpected = model.load_state_dict(state, strict=False)
         logger.info(f"Loaded pretrained PP from {pretrained_pp_ckpt}")
+        logger.info(f"  missing_keys={len(missing)}: {missing}")
+        logger.info(f"  unexpected_keys={len(unexpected)}: {unexpected}")
 
     # check required config keys
     cfg_req_int(phase_cfg, "START_EPOCH")
